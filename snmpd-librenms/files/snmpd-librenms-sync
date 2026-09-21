@@ -198,7 +198,11 @@ locked_sync() {
 	[ "$file_changed" -eq 1 ] && cp "$STATE.wlifaces" "$LIBRENMS_DIR/wlInterfaces.txt"
 	if [ "$uci_changed" -eq 1 ]; then
 		apply_extends
-		[ -x /etc/init.d/snmpd ] && /etc/init.d/snmpd reload >/dev/null 2>&1
+		# Must be restart, not reload: the snmpd initscript defines no
+		# reload_service, so `reload` falls through to `start`, which
+		# regenerates /var/run/snmpd.conf but leaves the running daemon on
+		# its old config. `reload` silently does nothing useful here.
+		[ -x /etc/init.d/snmpd ] && /etc/init.d/snmpd restart >/dev/null 2>&1
 	fi
 	date +%s > "$STATE.last"
 	log "reconciled uci=$uci_changed wlInterfaces=$file_changed"

@@ -25,7 +25,8 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   UCI `/etc/config/snmpd` (never `/etc/default/snmpd`, which is Debian);
   `uci` section ids are `[A-Za-z0-9_]` only; never restore that file by
   copying over it (a later `uci commit` replays the in-memory delta); use
-  busybox `flock` in a subshell for locks. The wireless trigger is
-  `ubus subscribe hostapd` (`bss.add`/`bss.remove`), **not**
-  `/etc/hotplug.d/ieee80211`. `README.md` "snmpd field notes" has the full
-  list with the router/test details.
+  busybox `flock` in a subshell for locks; `/etc/init.d/snmpd reload` is a
+  no-op for config changes (no `reload_service`) — use `restart`. The
+  wireless trigger is `ubus subscribe hostapd` (`bss.add`/`bss.remove`),
+  **not** `/etc/hotplug.d/ieee80211`. `README.md` "snmpd field notes" has the
+  full list with the router/test details.

@@ -76,8 +76,13 @@ UCI / config:
   in-memory delta and a later `uci commit` replays it over the copy, undoing
   the restore. Restore through `uci`, or copy *and* `rm -f /tmp/.uci/snmpd`
   before the next `uci` call.
-- `/etc/init.d/snmpd reload` rewrites `/var/run/snmpd.conf` and is enough to
-  pick up config changes; the daemon itself is not restarted.
+- The snmpd initscript defines **no `reload_service`**, so
+  `/etc/init.d/snmpd reload` falls through to `start`: it rewrites
+  `/var/run/snmpd.conf` but does **not** restart the daemon, leaving the
+  running snmpd on its old config. Use `restart` whenever the generated config
+  changed (`snmpd-librenms-sync` does). Symptom of getting this wrong: the
+  config file shows the extends but `snmpwalk ... 1.3.6.1.4.1.8072.1.3.2.2.1.2`
+  lists only the handful the daemon started with.
 
 Dynamic trigger:
 
