@@ -21,3 +21,11 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   in `PKG_VERSION`.
 - Commit style: plain descriptive subject (see `git log`). The user controls
   pushes; commit locally, push only on request.
+- snmpd packages (`snmpd-defaults`, `snmpd-librenms`): OpenWrt's config is
+  UCI `/etc/config/snmpd` (never `/etc/default/snmpd`, which is Debian);
+  `uci` section ids are `[A-Za-z0-9_]` only; never restore that file by
+  copying over it (a later `uci commit` replays the in-memory delta); use
+  busybox `flock` in a subshell for locks. The wireless trigger is
+  `ubus subscribe hostapd` (`bss.add`/`bss.remove`), **not**
+  `/etc/hotplug.d/ieee80211`. `README.md` "snmpd field notes" has the full
+  list with the router/test details.

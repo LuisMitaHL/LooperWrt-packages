@@ -63,6 +63,47 @@ writes are rate-limited (`cooldown`) via `/etc/config/snmpd-librenms`.
 file directly, or a later `uci commit` replays its in-memory delta over your
 edit.
 
+## snmpd field notes (learned the hard way)
+
+UCI / config:
+
+- OpenWrt's config is `/etc/config/snmpd` (UCI). `/etc/default/snmpd` is the
+  Debian path and does not exist here.
+- `uci` section identifiers accept only `[A-Za-z0-9_]`. A section key built
+  from an ifname (`...phy0-ap0`) fails `uci set` with `Invalid argument`; run
+  that under `uci -q` and the failure is silent. Key-sanitise ifnames.
+- Never restore `/etc/config/snmpd` by copying a file over it: `uci` keeps an
+  in-memory delta and a later `uci commit` replays it over the copy, undoing
+  the restore. Restore through `uci`, or copy *and* `rm -f /tmp/.uci/snmpd`
+  before the next `uci` call.
+- `/etc/init.d/snmpd reload` rewrites `/var/run/snmpd.conf` and is enough to
+  pick up config changes; the daemon itself is not restarted.
+
+Dynamic trigger:
+
+- The per-wdev trigger is `ubus subscribe hostapd`, emitting
+  `{ "bss.add": {"name": "phy0-ap1"} }` and `bss.remove`.
+  `ubus call network.wireless status` is the band + SSID source.
+- `/etc/hotplug.d/ieee80211/` does **not** fire on `wifi up`/`wifi reload`
+  (it is a wiphy-add hook, cf. `10-wifi-detect`). `wifi reload` *does* emit
+  `bss.add` for a newly configured AP.
+- Lock the reconciler with busybox `flock`, scoped to a subshell. A `mkdir`
+  lock goes stale when a run is killed (SIGPIPE/SIGKILL), and an `exec 9>`
+  held by a long-lived watcher blocks every later run forever.
+
+Dev router (`root@192.168.1.1`):
+
+- The SSH host key has changed at least once (reflash). Use a throwaway
+  `UserKnownHostsFile` instead of editing the shared `known_hosts`.
+- BusyBox only: no `base64`, no `pkill`; `flock` is a busybox applet.
+- This workspace's host has `snmpwalk`/`snmpget`, so the router can be
+  queried directly, e.g.
+  `snmpget -v2c -c publicagentxD -Oqnv 192.168.1.1:16161 'NET-SNMP-EXTEND-MIB::nsExtendOutputFull."frequency-phy0-ap0"'`.
+- To uninstall: stop/disable the service, remove `/etc/librenms`,
+  `/etc/config/snmpd-librenms`, `/etc/init.d/snmpd-librenms`,
+  `/usr/sbin/snmpd-librenms-sync`, `/etc/uci-defaults/99-snmpd-defaults`,
+  delete the `lnms_*` extends, then restore the stock `/etc/config/snmpd`.
+
 ## Layout
 
 Flat feed root: one directory per package, each with `Makefile`
