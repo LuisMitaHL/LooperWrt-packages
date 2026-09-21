@@ -1,0 +1,61 @@
+#!/bin/sh
+# LooperWrt snmpd defaults. Idempotent: runs once from /etc/uci-defaults on
+# first boot, and from the package postinst on a running system.
+
+[ -x /sbin/uci ] || exit 0
+
+# --- agent: bind only the LooperWrt port --------------------------------
+if uci -q get snmpd.@agent[0] >/dev/null 2>&1; then
+	uci -q set snmpd.@agent[0].agentaddress='UDP:16161'
+else
+	uci -q set snmpd.agent=agent
+	uci -q set snmpd.agent.agentaddress='UDP:16161'
+fi
+
+# --- access: drop the stock "public" read path, add ours ----------------
+# stock sections: com2sec public/public6, group public_{v1,v2c,usm},
+# access public_access. "private" stays: it is localhost-only and read-write.
+for s in public public6 public_v1 public_v2c public_usm public_access; do
+	uci -q delete "snmpd.$s"
+done
+
+# access_default expands to: rocommunity <CommunityName> default
+uci -q delete snmpd.looperwrt_ro
+uci set snmpd.looperwrt_ro=access_default
+uci set snmpd.looperwrt_ro.Mode='rocommunity'
+uci set snmpd.looperwrt_ro.CommunityName='publicagentxD'
+uci set snmpd.looperwrt_ro.RestrictOID='no'
+
+# --- system -------------------------------------------------------------
+if uci -q get snmpd.@system[0] >/dev/null 2>&1; then
+	uci -q set snmpd.@system[0].sysLocation='La Paz, BO'
+	uci -q set snmpd.@system[0].sysContact='Admin'
+	# unset so the initscript derives sysName from the device hostname
+	uci -q delete snmpd.@system[0].sysName
+fi
+
+# --- always-available extends -------------------------------------------
+uci -q delete snmpd.temperature
+uci set snmpd.temperature=extend
+uci set snmpd.temperature.name='temperature'
+uci set snmpd.temperature.prog='/bin/cat'
+uci set snmpd.temperature.args='/sys/class/thermal/thermal_zone0/temp'
+
+uci -q delete snmpd.conntrack
+uci set snmpd.conntrack=extend
+uci set snmpd.conntrack.name='conntrack'
+uci set snmpd.conntrack.prog='/bin/sh'
+uci set snmpd.conntrack.args='-c "wc -l /proc/net/nf_conntrack | cut -f 1 -s -d \" \""'
+
+uci -q delete snmpd.hardware
+uci set snmpd.hardware=extend
+uci set snmpd.hardware.name='hardware'
+uci set snmpd.hardware.prog='/bin/cat'
+uci set snmpd.hardware.args='/sys/firmware/devicetree/base/model'
+
+uci commit snmpd
+
+# pick the change up immediately when installing onto a running system
+[ -x /etc/init.d/snmpd ] && /etc/init.d/snmpd restart >/dev/null 2>&1
+
+exit 0

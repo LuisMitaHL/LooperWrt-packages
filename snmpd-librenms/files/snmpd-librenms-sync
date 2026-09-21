@@ -1,0 +1,239 @@
+#!/bin/sh
+# snmpd-librenms-sync - keep snmpd's LibreNMS extends in step with the live
+# wireless interfaces.
+#
+# Modes:
+#   watch   reconcile once, then on every hostapd bss.add/bss.remove event
+#   once    reconcile a single time (testing / manual use)
+#
+# Desired state is derived from the running wdevs (iw dev), not from the UCI
+# wireless config, so it follows phyX-apY devices as they are actually created
+# and removed. Each AP contributes its own extend set; the aggregate
+# "clients-wlan" and the "interfaces" map cover the whole device.
+#
+# Flash-wear control:
+#   - the desired set is diffed against what is already on flash; nothing is
+#     written when they match
+#   - bss.add/bss.remove bursts are coalesced (debounce)
+#   - a write waits out the cooldown window since the previous write
+#
+# /etc/config/snmpd is only ever changed through uci. Never rewrite the file
+# directly: uci keeps its own in-memory delta and a later `uci commit` would
+# replay it over your edits.
+
+. /lib/functions.sh
+
+LIBRENMS_DIR=/etc/librenms
+UCI_PKG=snmpd
+SEC_PREFIX=lnms_
+STATE=/tmp/snmpd-librenms
+LOCK="$STATE.lock"
+
+DEBOUNCE=5
+COOLDOWN=30
+ENABLED=1
+
+log() { logger -t snmpd-librenms "$*" 2>/dev/null; }
+
+load_settings() {
+	config_load snmpd-librenms
+	config_get_bool ENABLED general enabled 1
+	config_get DEBOUNCE general debounce 5
+	config_get COOLDOWN general cooldown 30
+	case "$DEBOUNCE" in ''|*[!0-9]*) DEBOUNCE=5 ;; esac
+	case "$COOLDOWN" in ''|*[!0-9]*) COOLDOWN=30 ;; esac
+}
+
+sanitize() {
+	printf '%s' "$1" | sed 's/[^A-Za-z0-9_.-]/_/g'
+}
+
+# uci section identifiers accept only [A-Za-z0-9_]; anything else makes
+# `uci set` fail with "Invalid argument".
+sanitize_key() {
+	printf '%s' "$1" | sed 's/[^A-Za-z0-9_]/_/g'
+}
+
+section_key() { # metric ifname
+	printf 'lnms_%s_%s' "$(sanitize_key "$1")" "$(sanitize_key "$2")"
+}
+
+iface_band() { # frequency MHz
+	case "$1" in
+		''|*[!0-9]*) echo unknown ;;
+		*) if [ "$1" -lt 3000 ]; then echo 2.4G
+		   elif [ "$1" -lt 5925 ]; then echo 5G
+		   else echo 6G; fi ;;
+	esac
+}
+
+# live AP interfaces as: ifname<TAB>frequency<TAB>ssid
+ap_interfaces() {
+	iw dev 2>/dev/null | awk '
+		/^[[:space:]]*Interface / { ifn=$2; ssid="" }
+		/^[[:space:]]*ssid /      { sub(/^[[:space:]]*ssid[[:space:]]+/, ""); ssid=$0 }
+		/^[[:space:]]*type /      { type=$2 }
+		/^[[:space:]]*channel /   { freq=$3; gsub(/[()]/, "", freq)
+			if (type == "AP" && ifn != "") print ifn "\t" freq "\t" ssid }
+	' | sort
+}
+
+desired_extends() {
+	local ifn freq ssid
+
+	# static, always present
+	printf 'lnms_interfaces|interfaces|/bin/cat|%s/wlInterfaces.txt\n' "$LIBRENMS_DIR"
+	printf 'lnms_clients_wlan|clients-wlan|%s/wlClients.sh|\n' "$LIBRENMS_DIR"
+	printf 'lnms_distro|distro|%s/distro|\n' "$LIBRENMS_DIR"
+
+	# per-AP
+	ap_interfaces | while IFS="$(printf '\t')" read -r ifn freq ssid; do
+		[ -n "$ifn" ] || continue
+		emit() { # metric name script args
+			printf '%s|%s|%s/%s|%s\n' \
+				"$(section_key "$1" "$ifn")" "$2" "$LIBRENMS_DIR" "$3" "$4"
+		}
+		emit clients "clients-$ifn" wlClients.sh "$ifn"
+		emit frequency "frequency-$ifn" wlFrequency.sh "$ifn"
+		emit noise-floor "noise-floor-$ifn" wlNoiseFloor.sh "$ifn"
+		for dir in tx rx; do
+			for res in min avg max; do
+				emit "rate-$dir-$res" "rate-$dir-$ifn-$res" wlRate.sh "$ifn $dir $res"
+			done
+		done
+		for res in min avg max; do
+			emit "snr-$res" "snr-$ifn-$res" wlSNR.sh "$ifn $res"
+		done
+	done
+}
+
+desired_wlinterfaces() {
+	local ifn freq ssid name
+
+	ap_interfaces | while IFS="$(printf '\t')" read -r ifn freq ssid; do
+		[ -n "$ifn" ] || continue
+		name=$(sanitize "$ssid")
+		[ -n "$name" ] || name=-
+		printf '%s,%s-%s\n' "$ifn" "$(iface_band "$freq")" "$name"
+	done
+}
+
+current_extends() {
+	local sec name prog args
+
+	uci -q show "$UCI_PKG" 2>/dev/null | \
+		sed -n "s/^$UCI_PKG\.\(${SEC_PREFIX}[^=]*\)=extend$/\1/p" | \
+	while read -r sec; do
+		name=$(uci -q get "$UCI_PKG.$sec.name")
+		prog=$(uci -q get "$UCI_PKG.$sec.prog")
+		args=$(uci -q get "$UCI_PKG.$sec.args")
+		printf '%s|%s|%s|%s\n' "$sec" "$name" "$prog" "$args"
+	done
+}
+
+apply_extends() {
+	local sec name prog args
+
+	uci -q show "$UCI_PKG" 2>/dev/null | \
+		sed -n "s/^$UCI_PKG\.\(${SEC_PREFIX}[^=]*\)=extend$/\1/p" | \
+	while read -r sec; do
+		uci -q delete "$UCI_PKG.$sec"
+	done
+
+	while IFS='|' read -r sec name prog args; do
+		[ -n "$sec" ] || continue
+		uci set "$UCI_PKG.$sec=extend" || continue
+		uci set "$UCI_PKG.$sec.name=$name"
+		uci set "$UCI_PKG.$sec.prog=$prog"
+		[ -n "$args" ] && uci set "$UCI_PKG.$sec.args=$args"
+	done < "$STATE.desired"
+
+	uci commit "$UCI_PKG"
+}
+
+# Coalesce a burst of bss.add/bss.remove events, then reconcile once. Waits for
+# DEBOUNCE seconds of quiet and never writes sooner than COOLDOWN seconds after
+# the previous write. Runs inline in the watcher: no background jobs, so the
+# reconciliation lock fd cannot leak into a long-lived child.
+debounce_then_sync() {
+	last=$(cat "$STATE.last" 2>/dev/null || echo 0)
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+
+	target=$(( $(date +%s) + DEBOUNCE ))
+	[ $(( last + COOLDOWN )) -gt "$target" ] && target=$(( last + COOLDOWN ))
+
+	while :; do
+		printf '%s\n' "$target" > "$STATE.due"
+		[ "$(date +%s)" -ge "$target" ] && break
+		if read -t 1 -r drained; then
+			target=$(( $(date +%s) + DEBOUNCE ))
+			[ $(( last + COOLDOWN )) -gt "$target" ] && target=$(( last + COOLDOWN ))
+		fi
+	done
+	rm -f "$STATE.due"
+	sync_once
+}
+
+# Runs under the lock. The locking fd lives in a subshell and is released the
+# moment the run ends.
+locked_sync() {
+	flock -n 9 || exit 0
+
+	load_settings
+	[ "$ENABLED" -eq 1 ] || exit 0
+
+	mkdir -p "$LIBRENMS_DIR"
+
+	desired_extends | sort > "$STATE.desired"
+	current_extends | sort > "$STATE.current"
+	desired_wlinterfaces > "$STATE.wlifaces"
+
+	uci_changed=0
+	file_changed=0
+	cmp -s "$STATE.desired" "$STATE.current" || uci_changed=1
+	cmp -s "$STATE.wlifaces" "$LIBRENMS_DIR/wlInterfaces.txt" 2>/dev/null || file_changed=1
+
+	[ "$uci_changed" -eq 0 ] && [ "$file_changed" -eq 0 ] && exit 0
+
+	[ "$file_changed" -eq 1 ] && cp "$STATE.wlifaces" "$LIBRENMS_DIR/wlInterfaces.txt"
+	if [ "$uci_changed" -eq 1 ]; then
+		apply_extends
+		[ -x /etc/init.d/snmpd ] && /etc/init.d/snmpd reload >/dev/null 2>&1
+	fi
+	date +%s > "$STATE.last"
+	log "reconciled uci=$uci_changed wlInterfaces=$file_changed"
+}
+
+# flock (busybox applet) releases on process death, unlike a mkdir lock which
+# goes stale when a run is killed.
+sync_once() {
+	( locked_sync ) 9>"$LOCK"
+}
+
+watch() {
+	rm -f "$STATE.due" "$STATE.last"
+	# a directory here (from an older lock scheme, say) would make 9>"$LOCK"
+	# fail and silently disable every reconciliation
+	rm -rf "$LOCK"
+	load_settings
+	sync_once
+	log "watching hostapd for bss add/remove"
+	while :; do
+		ubus subscribe hostapd | while read -r event; do
+			case "$event" in
+				*bss.add*|*bss.remove*) debounce_then_sync ;;
+			esac
+		done
+		# hostapd restarted (wifi reload/down/up) and the subscription
+		# dropped: resubscribe and reconcile once to close the gap
+		log "hostapd subscription ended, resubscribing"
+		sleep 2
+		sync_once
+	done
+}
+
+case "$1" in
+	watch) watch ;;
+	once|"") sync_once ;;
+	*) echo "usage: $0 [watch|once]" >&2; exit 1 ;;
+esac

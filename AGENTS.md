@@ -15,7 +15,9 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   wins. Builder side lives in `laotrared-aurora-build/build-firmware.sh`
   (`prepare_feeds`, `stamp_looperwrt_versions`, `verify_looperwrt`).
 - HEAD-owned packages (`antilag`, `luci-app-antilag`, `tailscale-route-watchdog`,
-  `mwan3-bootfix`) carry a static base `PKG_VERSION`; the builder stamps
-  `<base>.<YYYYMMDD>.<epoch>` at build time.
+  `mwan3-bootfix`, `snmpd-defaults`, `snmpd-librenms`) carry a static base
+  `PKG_VERSION`; the builder stamps `<base>.<YYYYMMDD>.<epoch>` at build time.
+  `snmpd-librenms` pins its upstream download in `PKG_SOURCE_VERSION`, never
+  in `PKG_VERSION`.
 - Commit style: plain descriptive subject (see `git log`). The user controls
   pushes; commit locally, push only on request.
