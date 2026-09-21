@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# mwan3-bootfix: schedule one delayed `mwan3 restart` after boot.
+# mwan3 can apply itself incorrectly at boot (upstream bug); a single
+# restart ~3 min later settles it. The worker guards on UCI + mwan3
+# presence, so this is safe on images without mwan3 configured.
+
+START=99
+STOP=10
+
+start() {
+	# Per-boot sentinel (tmpfs): start() may run more than once.
+	[ -f /tmp/mwan3-bootfix.scheduled ] && return 0
+	: > /tmp/mwan3-bootfix.scheduled
+	/usr/sbin/mwan3-bootfix >/dev/null 2>&1 &
+	return 0
+}
+
+stop() {
+	return 0
+}

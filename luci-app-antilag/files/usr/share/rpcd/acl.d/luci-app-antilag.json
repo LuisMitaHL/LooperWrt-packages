@@ -1,0 +1,23 @@
+{
+    "luci-app-antilag": {
+        "description": "Grant access for luci-app-antilag",
+        "read": {
+            "uci": [ "antilag" ],
+            "file": {
+                "/var/run/antilag-*.json": [ "read", "stat" ],
+                "/tmp/run/antilag-*.json": [ "read", "stat" ]
+            },
+            "ubus": {
+                "file":    [ "read", "stat" ],
+                "service": [ "list" ],
+                "luci":    [ "getInitList", "getInitStatus", "setInitAction" ]
+            }
+        },
+        "write": {
+            "uci": [ "antilag" ],
+            "ubus": {
+                "luci": [ "setInitAction" ]
+            }
+        }
+    }
+}
