@@ -16,10 +16,12 @@ src-git looperwrt https://github.com/LuisMitaHL/LooperWrt-packages.git;main
 | `tailscale-route-watchdog` | 0.1 | Self-healing watchdog for Tailscale policy routing (table 52). Aurora core only. |
 | `mwan3-bootfix` | 0.1 | One-shot delayed `mwan3 restart` after boot. Core only. |
 | `net-snmp` | 5.9.4-7 | **Override** of `packages/net/net-snmp` (stock 5.9.4-6). Only deltas: `PKG_RELEASE` 6→7 and `--with-persistent-directory=/tmp/snmp/` (tmpfs, avoids flash wear; stock uses `/usr/lib/snmp/`). Rebase procedure below. |
+| `tailscale` | 1.102.4 | **Override** of `packages/net/tailscale` (newer upstream than the stock 25.12 feed copy). Upstream-tracked version: never HEAD-stamped. Migrated from the in-tree `package/net/tailscale` on `openwrt-25.12-aurora`. |
 
 Build-time version stamp rewrites each `PKG_VERSION` to
 `<base>.<YYYYMMDD>.<epoch>` from this feed's HEAD (numeric dotted form,
-apk-safe). See `build-firmware.sh` `stamp_looperwrt_versions`.
+apk-safe). Exemptions: `net-snmp` and `tailscale` track upstream releases
+and are never stamped. See `build-firmware.sh` `stamp_looperwrt_versions`.
 
 ## Layout
 
