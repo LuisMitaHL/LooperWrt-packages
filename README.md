@@ -66,6 +66,12 @@ writes are rate-limited (`cooldown`) via `/etc/config/snmpd-librenms`.
 file directly, or a later `uci commit` replays its in-memory delta over your
 edit.
 
+Every reconcile that writes logs its delta to syslog, tag `snmpd-librenms`
+(`logread -e snmpd-librenms`): one line per extend added/removed, the
+`wlInterfaces.txt` `-`/`+` delta, the snmpd restart result, then a
+`reconciled uci=… wlInterfaces=…` summary. No-change runs stay silent, so any
+line means flash was written.
+
 ## snmpd field notes (learned the hard way)
 
 UCI / config:

@@ -17,6 +17,9 @@
 #   - bss.add/bss.remove bursts are coalesced (debounce)
 #   - a write waits out the cooldown window since the previous write
 #
+# Every run that writes logs its delta to syslog (tag snmpd-librenms):
+# `logread -e snmpd-librenms`. Runs with nothing to change stay silent.
+#
 # /etc/config/snmpd is only ever changed through uci. Never rewrite the file
 # directly: uci keeps its own in-memory delta and a later `uci commit` would
 # replay it over your edits.
@@ -131,6 +134,51 @@ current_extends() {
 	done
 }
 
+# Syslog detail for a reconcile: one line per extend that appeared or
+# disappeared. Inputs are the state files written by locked_sync. Sections are
+# keyed metric+ifname, so a key that survives a change keeps identical
+# name/prog/args — whole-line membership is enough, no comm/diff needed.
+log_extend_changes() { # current desired
+	local line name
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		grep -Fqx -e "$line" "$1" && continue
+		name=${line#*|}
+		log "extend added: ${name%%|*}"
+	done < "$2"
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		grep -Fqx -e "$line" "$2" && continue
+		name=${line#*|}
+		log "extend removed: ${name%%|*}"
+	done < "$1"
+}
+
+# wlInterfaces.txt delta on syslog: "-" lines dropped, "+" lines added;
+# creation logs the whole new file instead.
+log_wlifaces_change() { # installed desired
+	local line out=
+	if [ -f "$1" ]; then
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			grep -Fqx -e "$line" "$2" && continue
+			out="$out -$line"
+		done < "$1"
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			grep -Fqx -e "$line" "$1" && continue
+			out="$out +$line"
+		done < "$2"
+		[ -n "$out" ] || out=" (order changed)"
+		log "wlInterfaces.txt changed:$out"
+	else
+		while IFS= read -r line; do
+			[ -n "$line" ] && out="$out $line"
+		done < "$2"
+		log "wlInterfaces.txt created:$out"
+	fi
+}
+
 apply_extends() {
 	local sec name prog args
 
@@ -195,6 +243,11 @@ locked_sync() {
 
 	[ "$uci_changed" -eq 0 ] && [ "$file_changed" -eq 0 ] && exit 0
 
+	# log the actual delta before it is applied: after apply_extends the
+	# config already matches and the diff is gone
+	[ "$uci_changed" -eq 1 ] && log_extend_changes "$STATE.current" "$STATE.desired"
+	[ "$file_changed" -eq 1 ] && log_wlifaces_change "$LIBRENMS_DIR/wlInterfaces.txt" "$STATE.wlifaces"
+
 	[ "$file_changed" -eq 1 ] && cp "$STATE.wlifaces" "$LIBRENMS_DIR/wlInterfaces.txt"
 	if [ "$uci_changed" -eq 1 ]; then
 		apply_extends
@@ -202,7 +255,15 @@ locked_sync() {
 		# reload_service, so `reload` falls through to `start`, which
 		# regenerates /var/run/snmpd.conf but leaves the running daemon on
 		# its old config. `reload` silently does nothing useful here.
-		[ -x /etc/init.d/snmpd ] && /etc/init.d/snmpd restart >/dev/null 2>&1
+		if [ -x /etc/init.d/snmpd ]; then
+			if /etc/init.d/snmpd restart >/dev/null 2>&1; then
+				log "snmpd restarted for new extend set"
+			else
+				log "snmpd restart FAILED, running daemon still on old config"
+			fi
+		else
+			log "snmpd init script missing, extend changes not loaded"
+		fi
 	fi
 	date +%s > "$STATE.last"
 	log "reconciled uci=$uci_changed wlInterfaces=$file_changed"
