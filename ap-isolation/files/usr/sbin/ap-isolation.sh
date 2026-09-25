@@ -15,7 +15,7 @@ EOF
 
 _is_enabled() {
 	local val
-	config_get_bool val settings enabled 1
+	config_get_bool val settings enabled 0
 	[ "$val" = "1" ]
 }
 

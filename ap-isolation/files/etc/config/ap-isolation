@@ -1,5 +1,5 @@
 config ap_isolation 'settings'
-	option enabled '1'
+	option enabled '0'
 	option vlan_id ''
 	option gateway_ip ''
 	option gateway_mac ''
