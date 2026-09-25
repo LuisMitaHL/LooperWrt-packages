@@ -1,0 +1,141 @@
+# zz-ap-network-defaults -- dumb-AP network layout for every `ap` profile
+# image (aurora, mt7621, ipq40xx cAP ac). Sourced once by uci_apply_defaults
+# (init.d/boot) and removed on success; the looperwrt.ap_netdefaults marker in
+# /etc/config/looperwrt (preserved by a settings-kept sysupgrade) stops later
+# flashes from re-applying it. Named zz-* so it runs AFTER the branch's
+# per-target 99_*-defaults -- those set antilag primary.enabled='1' and
+# ul_if='wan', which must not win over this.
+#
+# Result on a fresh install:
+#   * every physical port is a br-lan port, the wan interface is gone
+#   * lan is a DHCP client (its address comes from the network's router)
+#   * DHCPv4, DHCPv6 and RA servers are off; dnsmasq keeps serving DNS
+#   * antilag is disabled: there is no L3 uplink left to shape
+
+if uci -q get looperwrt.ap_netdefaults.applied >/dev/null; then
+	exit 0
+fi
+
+# preinit did not run / config not generated yet: keep the script for the
+# next boot instead of marking it applied.
+[ -f /etc/config/network ] || exit 1
+
+# Print the uci section id (named or @type[N]) of the `config device` section
+# whose option name is $1. Re-run right before every delete so anonymous
+# @device[N] indices are resolved against the current list, never stale.
+devsec() {
+	uci -q show network | sed -n "s/^network\.\([^.=]*\)\.name='$1'\$/\1/p" | head -n1
+}
+
+# --- 1. collect the port(s) of every non-lan interface into br-lan ---------
+absorb=""      # netdevs to enslave into br-lan
+dropdevs=""    # device-section netdev names to delete (re-resolved later)
+dropifs=""     # interface sections to delete
+for s in $(uci -q show network | sed -n 's/^network\.\([^.=]*\)=interface$/\1/p'); do
+	[ "$s" = "lan" ] && continue
+	[ "$(uci -q get "network.$s.proto")" = "none" ] && continue   # tailscale/mesh
+	dev=$(uci -q get "network.$s.device")
+	[ -n "$dev" ] || continue
+	case "$dev" in
+		lo|tailscale0) continue ;;
+	esac
+	dsec=$(devsec "$dev")
+	if [ -n "$dsec" ] && [ "$(uci -q get "network.$dsec.type")" = "bridge" ]; then
+		# the interface is a bridge (e.g. a hand-made br-wan): enslave its
+		# member ports, not the bridge itself, then drop the bridge device
+		for p in $(uci -q get "network.$dsec.ports"); do absorb="$absorb $p"; done
+		dropdevs="$dropdevs $dev"
+	else
+		absorb="$absorb $dev"
+		[ -n "$dsec" ] && dropdevs="$dropdevs $dev"
+	fi
+	dropifs="$dropifs $s"
+done
+
+# --- 2. br-lan must exist and hold every physical port ---------------------
+lan_dev=$(uci -q get network.lan.device)
+if [ -n "$lan_dev" ] && [ "$lan_dev" != "br-lan" ]; then
+	# lan sits on a plain netdev: enslave it too, then point lan at the bridge
+	absorb="$absorb $lan_dev"
+	uci -q set network.lan.device='br-lan'
+	[ -n "$(devsec "$lan_dev")" ] && dropdevs="$dropdevs $lan_dev"
+fi
+lsec=$(devsec "br-lan")
+if [ -z "$lsec" ]; then
+	uci -q batch <<-EOF
+		set network.lan.device='br-lan'
+		add network device
+		set network.@device[-1].name='br-lan'
+		set network.@device[-1].type='bridge'
+	EOF
+	lsec=$(devsec "br-lan")
+fi
+ports=" $(uci -q get "network.$lsec.ports") "
+for p in $absorb; do
+	case "$ports" in
+		*" $p "*) ;;
+		*)
+			uci -q add_list "network.$lsec.ports=$p"
+			ports="$ports$p "
+			;;
+	esac
+done
+
+# --- 3. remove the absorbed interfaces and their device sections -----------
+for d in $dropdevs; do
+	s=$(devsec "$d")
+	[ -n "$s" ] && uci -q delete "network.$s"
+done
+for s in $dropifs; do
+	uci -q delete "network.$s"
+done
+
+# --- 4. lan becomes a DHCP client -------------------------------------------
+uci -q set network.lan.proto='dhcp'
+uci -q delete network.lan.ipaddr
+uci -q delete network.lan.netmask
+uci -q delete network.lan.ip6assign
+
+# --- 5. drop dhcp sections whose interface no longer exists (wan6 etc.) ----
+# Anonymous @dhcp[N] ids shift when one is deleted, so rescan after every
+# successful delete instead of trusting a list captured up front.
+while :; do
+	kill=""
+	for s in $(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dhcp$/\1/p'); do
+		ifname=$(uci -q get "dhcp.$s.interface")
+		if [ -n "$ifname" ] && ! uci -q get "network.$ifname" >/dev/null 2>&1; then
+			uci -q delete "dhcp.$s"
+			kill=1
+			break
+		fi
+	done
+	[ -z "$kill" ] && break
+done
+
+# --- 6. DHCPv4, DHCPv6 and RA servers fully off -----------------------------
+# ignore=1 stops dnsmasq's DHCPv4; odhcpd parses ra/dhcpv6/ndp/dhcpv4 as
+# "disabled" (parse_mode in its config.c) and keeps iface->ignore=true when
+# no mode is != disabled. The section stays so LuCI can re-enable it.
+for s in $(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dhcp$/\1/p'); do
+	uci -q set "dhcp.$s.ignore=1"
+	uci -q set "dhcp.$s.ra=disabled"
+	uci -q set "dhcp.$s.dhcpv6=disabled"
+	uci -q set "dhcp.$s.ndp=disabled"
+	uci -q set "dhcp.$s.dhcpv4=disabled"
+done
+uci -q commit dhcp
+
+# --- 7. antilag has no L3 uplink to shape on a dumb AP ----------------------
+if [ -f /etc/config/antilag ]; then
+	uci -q set antilag.primary.enabled='0'
+	uci -q commit antilag
+fi
+
+# --- 8. mark as applied (marker survives a settings-kept sysupgrade) -------
+touch /etc/config/looperwrt
+uci -q set looperwrt.ap_netdefaults=defaults
+uci -q set looperwrt.ap_netdefaults.applied='1'
+uci -q commit looperwrt
+uci -q commit network
+
+exit 0

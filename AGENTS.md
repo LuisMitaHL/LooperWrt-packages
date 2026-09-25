@@ -16,7 +16,7 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   (`prepare_feeds`, `stamp_looperwrt_versions`, `verify_looperwrt`).
 - HEAD-owned packages (`antilag`, `luci-app-antilag`, `tailscale-route-watchdog`,
   `mwan3-bootfix`, `snmpd-defaults`, `snmpd-librenms`, `dhcpoptinj`,
-  `ap-isolation`) carry a static base `PKG_VERSION`; the builder stamps `<base>.<YYYYMMDD>.<epoch>` at build time.
+  `ap-isolation`, `ap-network-defaults`) carry a static base `PKG_VERSION`; the builder stamps `<base>.<YYYYMMDD>.<epoch>` at build time.
   `snmpd-librenms` pins its upstream download in `PKG_SOURCE_VERSION`, never
   in `PKG_VERSION`; `dhcpoptinj` follows the same rule (HTTPS git pin at
   `https://github.com/LuisMitaHL/dhcpoptinj`).
@@ -25,6 +25,11 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   `LuisMitaHL/openwrt-public-ap-isolation` — this feed is the build source of
   truth; sync from those repos when they change. Both are selected on every
   `ap` profile via `configs/ap.config` in the builder.
+- `ap-network-defaults` is feed-native (no vendor repo): the uci-defaults
+  script `zz-ap-network-defaults` converting ap images to dumb-AP networking
+  (all physical ports → br-lan, wan iface removed, lan as DHCP client,
+  DHCPv4/DHCPv6/RA servers off, antilag disabled). Also selected on every
+  `ap` profile via `configs/ap.config`.
 - Commit style: plain descriptive subject (see `git log`). The user controls
   pushes; commit locally, push only on request.
 - snmpd packages (`snmpd-defaults`, `snmpd-librenms`): OpenWrt's config is
