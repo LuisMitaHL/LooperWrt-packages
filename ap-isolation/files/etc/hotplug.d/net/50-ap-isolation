@@ -1,0 +1,8 @@
+#!/bin/sh
+
+[ "$ACTION" = "add" ] || exit 0
+
+case "$DEVTYPE" in
+	wlan*) /etc/init.d/ap-isolation reload >/dev/null 2>&1 & ;;
+	*) exit 0 ;;
+esac

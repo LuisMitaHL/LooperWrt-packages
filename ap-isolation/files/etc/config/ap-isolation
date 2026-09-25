@@ -1,0 +1,6 @@
+config ap_isolation 'settings'
+	option enabled '1'
+	option vlan_id ''
+	option gateway_ip ''
+	option gateway_mac ''
+	option ipv6_enabled '0'

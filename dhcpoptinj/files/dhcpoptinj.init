@@ -1,0 +1,131 @@
+#!/bin/sh /etc/rc.common
+
+START=80
+USE_PROCD=1
+
+PROG=/usr/bin/dhcpoptinj
+
+append_option() {
+	procd_append_param command -o "$1"
+}
+
+append_exclude_match() {
+	exclude_iface_match="$exclude_iface_match iifname != $1"
+}
+
+nft_setup_rules() {
+	local queue="$1" interface="$2" snoop="$3" exclude_iface_match="$4" iface_match
+
+	nft list table bridge dhcpoptinj >/dev/null 2>&1 || \
+		nft add table bridge dhcpoptinj || {
+			logger -t dhcpoptinj "failed to create nftables table"
+			return 1
+		}
+
+	nft list chain bridge dhcpoptinj prerouting >/dev/null 2>&1 || \
+		nft add chain bridge dhcpoptinj prerouting \
+			'{ type filter hook prerouting priority dstnat; policy accept; }' || {
+			logger -t dhcpoptinj "failed to create nftables chain"
+			return 1
+		}
+
+	nft flush chain bridge dhcpoptinj prerouting
+
+	[ -n "$interface" ] && iface_match="iifname $interface"
+
+	case "$snoop" in
+		request)
+			nft add rule bridge dhcpoptinj prerouting \
+				$iface_match $exclude_iface_match ip protocol udp udp dport 67 counter queue num "$queue" bypass || {
+				logger -t dhcpoptinj "failed to add nftables rule for port 67"
+				return 1
+			}
+			;;
+		reply)
+			nft add rule bridge dhcpoptinj prerouting \
+				$iface_match $exclude_iface_match ip protocol udp udp dport 68 counter queue num "$queue" bypass || {
+				logger -t dhcpoptinj "failed to add nftables rule for port 68"
+				return 1
+			}
+			;;
+		*)
+			nft add rule bridge dhcpoptinj prerouting \
+				$iface_match $exclude_iface_match ip protocol udp udp dport 67 counter queue num "$queue" bypass || {
+				logger -t dhcpoptinj "failed to add nftables rule for port 67"
+				return 1
+			}
+			nft add rule bridge dhcpoptinj prerouting \
+				$iface_match $exclude_iface_match ip protocol udp udp dport 68 counter queue num "$queue" bypass || {
+				logger -t dhcpoptinj "failed to add nftables rule for port 68"
+				return 1
+			}
+			;;
+	esac
+}
+
+nft_remove_rules() {
+	nft delete table bridge dhcpoptinj 2>/dev/null
+	return 0
+}
+
+start_service() {
+	local enabled queue debug forward_on_fail conflict pid_file snoop interface exclude_iface_match
+
+	config_load 'dhcpoptinj'
+	config_get_bool enabled 'main' 'enabled' '0'
+	[ "$enabled" -eq 1 ] || return 0
+
+	config_get queue 'main' 'queue'
+	config_get_bool debug 'main' 'debug' '0'
+	config_get_bool forward_on_fail 'main' 'forward_on_fail' '0'
+	config_get conflict 'main' 'conflict'
+	config_get pid_file 'main' 'pid_file'
+	config_get snoop 'main' 'snoop'
+	config_get interface 'main' 'interface'
+
+	exclude_iface_match=""
+	config_list_foreach 'main' 'exclude_interface' append_exclude_match
+
+	[ -n "$queue" ] || {
+		logger -t dhcpoptinj "queue number is required"
+		return 1
+	}
+
+	if [ "$snoop" != "none" ]; then
+		nft_setup_rules "$queue" "$interface" "$snoop" "$exclude_iface_match" || return 1
+	fi
+
+	procd_open_instance
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param command "$PROG"
+	procd_append_param command -f -q "$queue"
+
+	[ "$debug" -eq 1 ] && procd_append_param command -d
+	[ "$forward_on_fail" -eq 1 ] && procd_append_param command --forward-on-fail
+
+	case "$conflict" in
+		ignore) procd_append_param command -i ;;
+		remove) procd_append_param command -r ;;
+	esac
+
+	[ -n "$pid_file" ] && procd_append_param command -p "$pid_file"
+
+	config_list_foreach 'main' 'option' append_option
+
+	procd_set_param respawn
+	procd_close_instance
+}
+
+stop_service() {
+	nft_remove_rules
+}
+
+service_triggers() {
+	procd_add_reload_trigger 'dhcpoptinj'
+}
+
+reload_service() {
+	stop
+	start
+}
