@@ -1,12 +1,23 @@
 #!/usr/bin/ucode
-/* ts-watchdog - keep Tailscale's policy routing rules and routing table
- * (default 52) populated on OpenWrt.
+/* ts-watchdog cycle - ONE-SHOT watchdog cycle for Tailscale's policy
+ * routing rules and routing table (default 52) on OpenWrt.
+ *
+ * Runs once per invocation; a busybox-sh supervisor (ts-watchdog) loops
+ * it on the configured interval under procd. One-shot on purpose:
+ * a long-lived interpreter accumulating state across cycles turned out
+ * to be fragile (any internal failure takes down all future cycles and
+ * resets every rate limiter), while a per-cycle process contains any
+ * failure - it is logged, retried next interval, and costs a few ms of
+ * interpreter startup against the ~0.5 s tailscale fork.
  *
  * On mwan3/netifd-heavy routers, tailscaled's table 52 routes can end up
  * wiped (its own reconcile races netlink churn, or the tun device flaps)
  * while tailscaled considers its state fine and never re-applies them.
  * The ip rules at the 52xx base are self-healed by tailscaled >= 1.102
- * (netmon.RuleDeleted handler), but table 52 routes are not.
+ * (netmon.RuleDeleted handler), but table 52 routes are not. During such
+ * churn storms tailscaled's reconcile can also wipe freshly re-added
+ * routes again; convergence is by repeated heals and the flap escalation
+ * below.
  *
  * Strategy (dl12345/mwan3-tailscale-setup compatible: mwan3 priority bases
  * at 1100/1200 mean tailscale installs at its default 5200 base):
@@ -21,8 +32,7 @@
  *   - re-add the missing desired routes directly via netlink (the
  *     desired set comes from tailscale's live view, not a cache, so
  *     control-plane deletions (peer left, subnet route withdrawn, exit
- *     node disabled) are never fought; known triggers of the wipe are
- *     mwan3 restarts and other netlink churn storms)
+ *     node disabled) are never fought)
  *   - also trigger `tailscale debug force-netmap-update`, which makes
  *     tailscaled re-apply its routes only when the netmap actually
  *     changed - a re-sent identical netmap is a no-op (the only debug
@@ -32,17 +42,30 @@
  *     routes (a bounce flushes the table and tailscaled does not
  *     reliably re-apply its v4 routes afterwards)
  *
- * Cost per cycle: one tailscale CLI fork (~0.5 s) and two small netlink
- * dumps. The tailscaled liveness check and the tailscale0 flag check are
- * pure ucode (procfs/sysfs), no forks.
+ * CPU budget: this script is built for CPU-limited routers. The cheap
+ * path of a cycle is forkless (procfs/sysfs reads and two small netlink
+ * dumps) and compares the actual table 52 content against the snapshot
+ * from the previous cycle; the expensive path (one `tailscale status
+ * --json` fork, ~0.5 s, 59 KB parse) only runs when the snapshot or the
+ * rules changed, when the previous cycle found missing routes, or every
+ * `refresh` cycles as a staleness bound. In a healthy steady state that
+ * is one status fork per refresh*interval seconds instead of per
+ * interval.
  *
- * Runs under procd; logs to stderr (forwarded to syslog). */
+ * Cross-cycle state (miss streak, heal/flap rate limiters, table
+ * snapshot, cycle counter) lives in /tmp/tswatchdog.state so the
+ * one-shot stays stateless and rate limiters survive supervisor
+ * restarts. /tmp is tmpfs: state resets on reboot, which just means the
+ * first cycle after boot does a full check.
+ *
+ * Logs via logger(1) into syslog (daemon facility). One fork per logged
+ * line; healthy cycles log nothing. */
 
 'use strict';
 
 import * as rtnl from 'rtnl';
 import * as uci from 'uci';
-import { open, popen, lsdir } from 'fs';
+import { open, popen, lsdir, readfile, rename } from 'fs';
 
 const C = rtnl.const;
 const RTM_GETRULE = C.RTM_GETRULE;
@@ -70,28 +93,31 @@ const TS_CGNAT_V4 = '100.64.0.0/10';
 const TS_QUAD100_V4 = '100.100.100.100/32';
 const TS_RESOLVER_V6 = 'fd7a:115c:a1e0::53/128';
 
+const STATE_FILE = '/tmp/tswatchdog.state';
+
 const cfg = {
-	interval: 30,
 	table: 52,
 	iface: 'tailscale0',
 	rule_base: 5200,
 	accept_routes: 1,
+	refresh: 20,
 	debug: 0
 };
 
-const state = {
+/* Cross-cycle state; persisted to STATE_FILE as JSON. */
+let state = {
 	miss: 0,
 	last_heal: 0,
 	last_flap: 0,
-	last_log: 0
+	cycle: 0,
+	snap: null
 };
 
-let logf = open('/dev/stderr', 'a');
-
 function log(lvl, msg) {
-	if (logf) {
-		logf.write('ts-watchdog: ' + lvl + ': ' + msg + '\n');
-	}
+	/* strip anything that would break the shell quoting */
+	let clean = replace(replace(msg, '"', "'"), '`', "'");
+	let pri = (lvl == 'warn') ? 'warning' : lvl;
+	system('logger -t ts-watchdog -p daemon.' + pri + " '" + clean + "'");
 }
 
 /* Verbose diagnostics, off by default (uci: option debug '1'). */
@@ -107,15 +133,56 @@ function load_config() {
 			let v = cur.get('tswatchdog', 'config', k);
 			return (v == null) ? d : v;
 		};
-		cfg.interval = int(g('interval', cfg.interval)) || cfg.interval;
 		cfg.table = int(g('table', cfg.table)) || cfg.table;
 		cfg.iface = g('iface', cfg.iface);
 		cfg.rule_base = int(g('rule_base', cfg.rule_base)) || cfg.rule_base;
 		cfg.accept_routes = int(g('accept_routes', cfg.accept_routes));
 		cfg.accept_routes = (cfg.accept_routes == null) ? 1 : cfg.accept_routes;
+		cfg.refresh = int(g('refresh', cfg.refresh)) || cfg.refresh;
+		if (cfg.refresh < 1)
+			cfg.refresh = 1;
 		cfg.debug = int(g('debug', cfg.debug)) || 0;
 	} catch (e) {
 		log('info', 'uci config unavailable, using defaults: ' + e);
+	}
+}
+
+function load_state() {
+	try {
+		let raw = readfile(STATE_FILE);
+		if (raw == null || raw == '')
+			return;
+
+		let d = json(raw);
+		state.miss = int(d.miss) ?? 0;
+		state.last_heal = int(d.last_heal) ?? 0;
+		state.last_flap = int(d.last_flap) ?? 0;
+		state.cycle = int(d.cycle) ?? 0;
+		state.snap = (type(d.snap) == 'string') ? d.snap : null;
+	} catch (e) {
+		/* unreadable state: start fresh */
+		state = { miss: 0, last_heal: 0, last_flap: 0, cycle: 0, snap: null };
+	}
+}
+
+function save_state() {
+	try {
+		/* this ucode build's json() only parses; serialize via %J */
+		let blob = sprintf('%J', {
+			miss: state.miss,
+			last_heal: state.last_heal,
+			last_flap: state.last_flap,
+			cycle: state.cycle,
+			snap: state.snap
+		});
+		let f = open(STATE_FILE + '.tmp', 'w');
+		if (f == null)
+			return;
+		f.write(blob);
+		f.close();
+		rename(STATE_FILE + '.tmp', STATE_FILE);
+	} catch (e) {
+		dbg('save state: ' + e);
 	}
 }
 
@@ -161,7 +228,12 @@ function expected_rules() {
 	];
 }
 
+/* fix_rules - re-add missing policy rules; returns how many were added
+ * (a nonzero count hints at a netlink churn event and forces the
+ * expensive check this cycle). */
 function fix_rules() {
+	let readded = 0;
+
 	for (let fam in [AF_INET, AF_INET6]) {
 		let rules = rtnl.request(RTM_GETRULE, NLM_F_DUMP, { family: fam }) ?? [];
 		let have = {};
@@ -190,10 +262,14 @@ function fix_rules() {
 			let err = rtnl.error();
 			if (err)
 				log('warn', 'rule add prio ' + e.prio + ' failed: ' + err);
-			else
+			else {
 				log('info', 're-added missing ip rule prio ' + e.prio);
+				readded++;
+			}
 		}
 	}
+
+	return readded;
 }
 
 /* ------------------------------------------------------------------ */
@@ -393,6 +469,13 @@ function actual_routes() {
 	return act;
 }
 
+/* snapshot - stable fingerprint of the actual table content, for the
+ * cheap change-detection pass (prefix sets only, no metric/ordering
+ * noise). */
+function snapshot(act) {
+	return join(' ', sort(keys(act.v4))) + '|' + join(' ', sort(keys(act.v6)));
+}
+
 function diff(want, act) {
 	let missing = { v4: [], v6: [] };
 	let coarse = act.v4[TS_CGNAT_V4];
@@ -495,10 +578,12 @@ function heal(miss, now) {
 }
 
 /* ------------------------------------------------------------------ */
-/* main loop                                                           */
+/* cycle                                                               */
 /* ------------------------------------------------------------------ */
 
-function cycle() {
+function run_cycle() {
+	state.cycle++;
+
 	if (!tailscaled_running()) {
 		dbg('cycle: tailscaled not running, skipping');
 		state.miss = 0;
@@ -511,11 +596,33 @@ function cycle() {
 		return;
 	}
 
-	fix_rules();
+	let rules_readded = fix_rules();
+
+	/* cheap path: forkless table fingerprint against the last cycle.
+	 * The expensive status fetch runs when the table or the rules
+	 * changed, while a heal is still pending (miss > 0 - never let the
+	 * cheap path stall the escalation), or every cfg.refresh cycles as
+	 * a staleness bound (a peer joining adds desired routes without
+	 * touching the table). */
+	let act = actual_routes();
+	let snap = snapshot(act);
+
+	let full = (state.snap == null) ||
+		(state.snap != snap) ||
+		(rules_readded > 0) ||
+		(state.miss > 0) ||
+		((state.cycle % cfg.refresh) == 0);
+
+	if (!full) {
+		dbg('cycle: cheap pass (table unchanged), no status fetch');
+		state.snap = snap;
+		return;
+	}
 
 	let st = read_ts_status();
 	if (st == null) {
 		dbg('cycle: status unavailable, skipping diff');
+		state.snap = snap;
 		return;
 	}
 
@@ -523,12 +630,14 @@ function cycle() {
 	// rather than risk demanding routes tailscale intentionally omits.
 	if (st.Self == null) {
 		dbg('cycle: status has no Self, skipping diff');
+		state.snap = snap;
 		return;
 	}
 
 	let want = desired_set(st);
-	let act = actual_routes();
 	let miss = diff(want, act);
+
+	state.snap = snap;
 
 	if (length(miss.v4) == 0 && length(miss.v6) == 0) {
 		dbg('cycle: ok, nothing missing');
@@ -542,25 +651,19 @@ function cycle() {
 }
 
 load_config();
+load_state();
 
-if (cfg.interval < 5)
-	cfg.interval = 5;
+let rc = 0;
 
-log('info', 'started (interval=' + cfg.interval + 's table=' + cfg.table +
-	' iface=' + cfg.iface + ' rule_base=' + cfg.rule_base +
-	' accept_routes=' + cfg.accept_routes + ' debug=' + cfg.debug + ')');
-
-while (true) {
-	try {
-		cycle();
-	} catch (e) {
-		log('warn', 'cycle error: ' + e);
-	}
-
-	/* ucode's sleep() is milliseconds-based in the ucode 2026.01.16
-	 * frozen for openwrt-25.12 (sleep(3) is 3 ms, not the seconds the
-	 * stdlib doc claims), which used to turn this loop into a busy
-	 * spin - one localapi poll pair per ~200 ms, syslog flooded, and
-	 * every rate limiter in the heal path useless. */
-	sleep(cfg.interval * 1000);
+try {
+	run_cycle();
+} catch (e) {
+	log('warn', 'cycle error: ' + e);
+	rc = 1;
 }
+
+save_state();
+
+/* exit code lets the supervisor distinguish clean cycles from internal
+ * errors (still retried either way - one-shot contains all failures) */
+exit(rc);

@@ -27,8 +27,10 @@ define Package/tailscale-route-watchdog/description
   rules and routing table (default 52), and restores them when
   netifd/mwan3 churn leaves tailscaled with wiped routes it never re-applies.
   Heals via `tailscale debug force-netmap-update`, never by blindly restoring
-  cached routes, so control-plane deletions are never fought. Designed for
-  mwan3 setups per dl12345/mwan3-tailscale-setup.
+  cached routes, so control-plane deletions are never fought. Runs one-shot
+  cycles under a supervisor loop with a forkless snapshot fast path for
+  CPU-limited routers. Designed for mwan3 setups per
+  dl12345/mwan3-tailscale-setup.
 endef
 
 define Package/tailscale-route-watchdog/conffiles
@@ -40,7 +42,8 @@ endef
 
 define Package/tailscale-route-watchdog/install
 	$(INSTALL_DIR) $(1)/usr/bin $(1)/etc/init.d $(1)/etc/config
-	$(INSTALL_BIN) ./files/ts-watchdog.uc $(1)/usr/bin/ts-watchdog
+	$(INSTALL_BIN) ./files/ts-watchdog.sh $(1)/usr/bin/ts-watchdog
+	$(INSTALL_BIN) ./files/ts-watchdog.uc $(1)/usr/bin/ts-watchdog-cycle.uc
 	$(INSTALL_BIN) ./files/tswatchdog.init $(1)/etc/init.d/tswatchdog
 	$(INSTALL_CONF) ./files/tswatchdog.config $(1)/etc/config/tswatchdog
 endef
