@@ -22,8 +22,9 @@ define Package/tailscale-route-watchdog
 endef
 
 define Package/tailscale-route-watchdog/description
-  Compares Tailscale's own view (debug netmap / prefs) against the kernel
-  policy rules and routing table (default 52), and restores them when
+  Compares Tailscale's own view (tailscale status --json: peer addresses,
+  primary subnet routes, exit node selection) against the kernel policy
+  rules and routing table (default 52), and restores them when
   netifd/mwan3 churn leaves tailscaled with wiped routes it never re-applies.
   Heals via `tailscale debug force-netmap-update`, never by blindly restoring
   cached routes, so control-plane deletions are never fought. Designed for

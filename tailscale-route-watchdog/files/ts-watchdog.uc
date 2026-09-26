@@ -14,8 +14,9 @@
  *   - verify the 4 policy rules per family (base+10/+30/+50/+70), re-add
  *     if missing (idempotent, NLM_F_EXCL)
  *   - derive the *desired* table 52 content from tailscale's own view:
- *     `tailscale debug netmap` (peer addresses, primary subnet routes)
- *     and `tailscale debug prefs` (RouteAll, exit node selection)
+ *     `tailscale status --json` (peer addresses, primary subnet routes,
+ *     exit node selection) - a stable CLI surface; no `tailscale debug`
+ *     endpoints
  *   - diff desired vs actual (netlink dump of the table)
  *   - re-add the missing desired routes directly via netlink (the
  *     desired set comes from tailscale's live view, not a cache, so
@@ -24,11 +25,16 @@
  *     mwan3 restarts and other netlink churn storms)
  *   - also trigger `tailscale debug force-netmap-update`, which makes
  *     tailscaled re-apply its routes only when the netmap actually
- *     changed - a re-sent identical netmap is a no-op
+ *     changed - a re-sent identical netmap is a no-op (the only debug
+ *     command left in the script; there is no stable equivalent)
  *   - last-resort escalation only: a rate-limited tailscale0 down/up
  *     with a real 1 s gap, followed by directly re-adding the desired
  *     routes (a bounce flushes the table and tailscaled does not
  *     reliably re-apply its v4 routes afterwards)
+ *
+ * Cost per cycle: one tailscale CLI fork (~0.5 s) and two small netlink
+ * dumps. The tailscaled liveness check and the tailscale0 flag check are
+ * pure ucode (procfs/sysfs), no forks.
  *
  * Runs under procd; logs to stderr (forwarded to syslog). */
 
@@ -36,7 +42,7 @@
 
 import * as rtnl from 'rtnl';
 import * as uci from 'uci';
-import { open, popen } from 'fs';
+import { open, popen, lsdir } from 'fs';
 
 const C = rtnl.const;
 const RTM_GETRULE = C.RTM_GETRULE;
@@ -57,12 +63,19 @@ const TS_MARK = 0x80000;
 const TS_MARK_MASK = 0xff0000;
 const TS_ULAGR_V6 = 'fd7a:115c:a1e0::/48';
 const TS_CGNAT_V4 = '100.64.0.0/10';
+/* Tailscale's resolver addresses are always routed to tailscale0 -
+ * observed installed with CorpDNS off, so treated as unconditional.
+ * fd7a:115c:a1e0::53 is the v6 counterpart of quad-100 (belongs to no
+ * peer; verified against a live netmap). */
+const TS_QUAD100_V4 = '100.100.100.100/32';
+const TS_RESOLVER_V6 = 'fd7a:115c:a1e0::53/128';
 
 const cfg = {
 	interval: 30,
 	table: 52,
 	iface: 'tailscale0',
 	rule_base: 5200,
+	accept_routes: 1,
 	debug: 0
 };
 
@@ -98,10 +111,38 @@ function load_config() {
 		cfg.table = int(g('table', cfg.table)) || cfg.table;
 		cfg.iface = g('iface', cfg.iface);
 		cfg.rule_base = int(g('rule_base', cfg.rule_base)) || cfg.rule_base;
+		cfg.accept_routes = int(g('accept_routes', cfg.accept_routes));
+		cfg.accept_routes = (cfg.accept_routes == null) ? 1 : cfg.accept_routes;
 		cfg.debug = int(g('debug', cfg.debug)) || 0;
 	} catch (e) {
 		log('info', 'uci config unavailable, using defaults: ' + e);
 	}
+}
+
+/* tailscaled_running - pure-ucode /proc scan for a process named
+ * "tailscaled", no fork. */
+function tailscaled_running() {
+	let dirs = lsdir('/proc') ?? [];
+
+	for (let e in dirs) {
+		/* this ucode build returns plain name strings; tolerate
+		 * {name,...} objects from other versions */
+		let name = (type(e) == 'object') ? e.name : e;
+		if (name == null || !match(name, /^[0-9]+$/))
+			continue;
+
+		let f = open('/proc/' + name + '/comm', 'r');
+		if (f == null)
+			continue;
+
+		let comm = f.read('all');
+		f.close();
+
+		if (comm != null && trim(comm) == 'tailscaled')
+			return true;
+	}
+
+	return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -159,10 +200,10 @@ function fix_rules() {
 /* tailscale state                                                     */
 /* ------------------------------------------------------------------ */
 
-function read_json_cmd(sub) {
-	let p = popen('tailscale debug ' + sub + ' 2>/dev/null');
+function read_ts_status() {
+	let p = popen('tailscale status --json 2>/dev/null');
 	if (!p) {
-		dbg(sub + ': popen failed');
+		dbg('status: popen failed');
 		return null;
 	}
 
@@ -170,44 +211,61 @@ function read_json_cmd(sub) {
 	p.close();
 
 	if (!out) {
-		dbg(sub + ': empty output');
+		dbg('status: empty output');
 		return null;
 	}
 
 	// Tolerate any log noise before the JSON document.
 	let pos = length(split(out, '{')[0]);
 	if (pos >= length(out)) {
-		dbg(sub + ': no JSON document in output (' + length(out) + ' bytes)');
+		dbg('status: no JSON document in output (' + length(out) + ' bytes)');
 		return null;
 	}
 
 	try {
 		let data = json(substr(out, pos));
-		dbg(sub + ': parsed ok (' + length(out) + ' bytes, noise prefix ' + pos + ')');
+		dbg('status: parsed ok (' + length(out) + ' bytes, noise prefix ' + pos + ')');
 		return data;
 	} catch (e) {
-		dbg(sub + ': JSON parse failed: ' + e);
+		dbg('status: JSON parse failed: ' + e);
 		return null;
 	}
 }
 
-function prefs_exit_selected(prefs) {
-	let id = prefs.ExitNodeID;
-	let ip = prefs.ExitNodeIP;
-
-	if (type(id) == 'string' && length(id) > 0 && id != 'unset')
+/* exit_node_selected - true when an exit node is in use. The top-level
+ * ExitNodeStatus is documented nil when unused; fall back to the
+ * per-peer ExitNode flags for builds without it. */
+function exit_node_selected(st) {
+	if (st.ExitNodeStatus != null)
 		return true;
 
-	if (type(ip) == 'string' && length(ip) > 0 && ip != 'invalid')
+	if (st.Self != null && st.Self.ExitNode)
 		return true;
+
+	for (let k, p in (st.Peer ?? {}))
+		if (p.ExitNode)
+			return true;
 
 	return false;
 }
 
 /* iface_up - true when cfg.iface exists and carries IFF_UP (0x1).
  * Note: /sys/class/net/<tun>/operstate reads "unknown" for tun devices,
- * so operstate cannot be used; use the link flags via rtnl instead. */
+ * so operstate cannot be used; the flags file carries the real bit. */
 function iface_up() {
+	let f = open('/sys/class/net/' + cfg.iface + '/flags', 'r');
+	if (f != null) {
+		let s = f.read('all');
+		f.close();
+
+		let m = match(s ?? '', /0x([0-9a-fA-F]+)/);
+		if (m != null)
+			return ((int(m[1], 16) ?? 0) & 1) != 0;
+
+		return false;
+	}
+
+	/* sysfs unavailable: fall back to a link dump */
 	let links = rtnl.request(RTM_GETLINK, NLM_F_DUMP, {}) ?? [];
 
 	for (let l in links) {
@@ -233,48 +291,60 @@ function in_cgnat(addr) {
 	return (a == 100 && b >= 64 && b < 128);
 }
 
-/* Compute the desired table 52 prefixes from tailscale's own view.
- * Mirrors net/routemanager's OS route set:
+/* Compute the desired table 52 prefixes from tailscale's own view
+ * (`tailscale status --json`). Mirrors net/routemanager's OS route set:
  *   - per-peer CGNAT /32s (or the coarse 100.64/10 aggregate)
- *   - the ULA aggregate /48 when any v6 peer route exists
- *   - subnet routes of peers we are primary for, when RouteAll is set
+ *   - the ULA aggregate /48 when any v6 peer route exists (per-peer v6
+ *     /128s are not installed by tailscaled; v6 peer traffic rides the
+ *     aggregate)
+ *   - subnet routes of peers we are primary for, when accept-routes is
+ *     on (uci option accept_routes mirrors the --accept-routes pref)
  *   - 0.0.0.0/0 and ::/0 whenever an exit node is selected (they stay
  *     installed to blackhole rather than leak, per routemanager)
+ *   - the resolver routes quad-100 and fd7a:115c:a1e0::53
  */
-function desired_set(prefs, nm) {
+function desired_set(st) {
 	let want = { v4: {}, v6: {} };
-	let peers = (nm.Peers != null) ? nm.Peers : [];
-	let selfID = (nm.SelfNode != null) ? nm.SelfNode.ID : null;
+	let peers = st.Peer ?? {};
 	let have6 = false;
+	let npeers = 0;
 
-	for (let p in peers) {
-		if (selfID != null && p.ID == selfID)
+	for (let k, p in peers) {
+		// key-expired peers get their routes dropped by tailscaled;
+		// never demand them
+		if (p.Expired) {
+			dbg('desired: peer ' + p.HostName + ' expired, skipping');
 			continue;
+		}
 
-		for (let a in (p.Addresses ?? [])) {
-			if (type(a) != 'string')
+		npeers++;
+
+		for (let ip in (p.TailscaleIPs ?? [])) {
+			if (type(ip) != 'string')
 				continue;
 
-			if (in_cgnat(split(a, '/')[0]))
-				want.v4[a] = true;
-			else if (match(a, /:/) != null)
+			if (in_cgnat(ip))
+				want.v4[ip + '/32'] = true;
+			else if (match(ip, /:/) != null)
 				have6 = true;
 		}
 
-		if (prefs.RouteAll) {
+		if (cfg.accept_routes) {
 			for (let pr in (p.PrimaryRoutes ?? [])) {
 				if (type(pr) != 'string')
 					continue;
 
 				if (match(pr, /:/) == null)
 					want.v4[pr] = true;
-				else
+				else {
+					want.v6[pr] = true;
 					have6 = true;
+				}
 			}
 		}
 	}
 
-	if (prefs_exit_selected(prefs)) {
+	if (exit_node_selected(st)) {
 		want.v4['0.0.0.0/0'] = true;
 		want.v6['::/0'] = true;
 	}
@@ -282,7 +352,10 @@ function desired_set(prefs, nm) {
 	if (have6)
 		want.v6[TS_ULAGR_V6] = true;
 
-	dbg('desired: peers=' + length(peers) + ' selfID=' + selfID + ' have6=' + have6 +
+	want.v4[TS_QUAD100_V4] = true;
+	want.v6[TS_RESOLVER_V6] = true;
+
+	dbg('desired: peers=' + npeers + ' have6=' + have6 +
 		' v4=[' + join(' ', keys(want.v4)) + '] v6=[' + join(' ', keys(want.v6)) + ']');
 
 	return want;
@@ -338,13 +411,6 @@ function diff(want, act) {
 	}
 
 	for (let k in keys(want.v6)) {
-		// the /48 aggregate is what routemanager tracks; a per-peer v6
-		// route missing while the aggregate is present is not an error
-		if (k != TS_ULAGR_V6 && act.v6[TS_ULAGR_V6]) {
-			dbg('diff: ' + k + ' skipped (ULA aggregate present)');
-			continue;
-		}
-
 		if (!act.v6[k])
 			push(missing.v6, k);
 	}
@@ -390,10 +456,10 @@ function heal(miss, now) {
 			' (streak ' + state.miss + ') - re-adding desired routes and forcing netmap update');
 
 		/* Re-add the routes that tailscale's own view still wants.
-		 * The desired set is derived from the live netmap/prefs, not a
+		 * The desired set is derived from the live status, not a
 		 * cached copy: when the control plane withdraws a route (peer
 		 * left, subnet route removed, exit node disabled), it drops out
-		 * of the desired set at the next netmap refresh and we stop
+		 * of the desired set at the next status refresh and we stop
 		 * enforcing it. force-netmap-update alone cannot restore a
 		 * wiped table - tailscaled only re-applies routes when a
 		 * received netmap differs from the previous one, and a re-sent
@@ -433,7 +499,7 @@ function heal(miss, now) {
 /* ------------------------------------------------------------------ */
 
 function cycle() {
-	if (system('pidof tailscaled >/dev/null 2>&1') != 0) {
+	if (!tailscaled_running()) {
 		dbg('cycle: tailscaled not running, skipping');
 		state.miss = 0;
 		return;
@@ -447,21 +513,20 @@ function cycle() {
 
 	fix_rules();
 
-	let prefs = read_json_cmd('prefs');
-	let nm = read_json_cmd('netmap');
-	if (prefs == null || nm == null) {
-		dbg('cycle: prefs or netmap unavailable, skipping diff');
+	let st = read_ts_status();
+	if (st == null) {
+		dbg('cycle: status unavailable, skipping diff');
 		return;
 	}
 
 	// Without a valid self node the peer set cannot be trusted; skip
 	// rather than risk demanding routes tailscale intentionally omits.
-	if (nm.SelfNode == null) {
-		dbg('cycle: netmap has no SelfNode, skipping diff');
+	if (st.Self == null) {
+		dbg('cycle: status has no Self, skipping diff');
 		return;
 	}
 
-	let want = desired_set(prefs, nm);
+	let want = desired_set(st);
 	let act = actual_routes();
 	let miss = diff(want, act);
 
@@ -483,7 +548,7 @@ if (cfg.interval < 5)
 
 log('info', 'started (interval=' + cfg.interval + 's table=' + cfg.table +
 	' iface=' + cfg.iface + ' rule_base=' + cfg.rule_base +
-	' debug=' + cfg.debug + ')');
+	' accept_routes=' + cfg.accept_routes + ' debug=' + cfg.debug + ')');
 
 while (true) {
 	try {
