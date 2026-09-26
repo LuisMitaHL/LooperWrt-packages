@@ -1,0 +1,14 @@
+#!/bin/sh
+# Pin tailscaled's GOMEMLIMIT heap ceiling to 40MiB on RAM-tight profiles.
+# Installed by the tailscale-lowmem package, which the builder selects
+# only via configs/core_lite.config (core images never get this file and
+# keep the 90MiB init fallback in /etc/init.d/tailscale).
+#
+# Apply-once: only fill an unset value or replace the stock 90MiB
+# default -- a manual override (e.g. 64MiB) survives re-flashes.
+cur="$(uci -q get tailscale.settings.gomemlimit)"
+[ -n "$cur" ] && [ "$cur" != '90MiB' ] && exit 0
+
+uci -q set tailscale.settings.gomemlimit='40MiB'
+uci -q commit tailscale
+exit 0

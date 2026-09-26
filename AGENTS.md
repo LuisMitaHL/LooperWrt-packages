@@ -16,7 +16,7 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   (`prepare_feeds`, `stamp_looperwrt_versions`, `verify_looperwrt`).
 - HEAD-owned packages (`antilag`, `luci-app-antilag`, `tailscale-route-watchdog`,
   `mwan3-bootfix`, `snmpd-defaults`, `snmpd-librenms`, `dhcpoptinj`,
-  `ap-isolation`, `ap-network-defaults`) carry a static base `PKG_VERSION`; the builder stamps `<base>.<YYYYMMDD>.<epoch>` at build time.
+  `ap-isolation`, `ap-network-defaults`, `tailscale-lowmem`) carry a static base `PKG_VERSION`; the builder stamps `<base>.<YYYYMMDD>.<epoch>` at build time.
   `snmpd-librenms` pins its upstream download in `PKG_SOURCE_VERSION`, never
   in `PKG_VERSION`; `dhcpoptinj` follows the same rule (HTTPS git pin at
   `https://github.com/LuisMitaHL/dhcpoptinj`).
