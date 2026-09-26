@@ -23,7 +23,11 @@ define Package/tailscale-lowmem
   CATEGORY:=Network
   SUBMENU:=VPN
   TITLE:=40MiB GOMEMLIMIT ceiling for tailscale on RAM-tight profiles
-  DEPENDS:=+tailscale
+  # Gated on the tailscale selection itself (NOT "+tailscale"): the
+  # fragment is selected for every core_lite build, and a hard dep would
+  # drag tailscale into images where the builder's tailscale gate
+  # (aurora/mt7621 core|core_lite) excludes it.
+  DEPENDS:=@PACKAGE_tailscale
   PKGARCH:=all
 endef
 
