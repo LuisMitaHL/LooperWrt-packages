@@ -47,6 +47,30 @@ uci set snmpd.conntrack.name='conntrack'
 uci set snmpd.conntrack.prog='/bin/sh'
 uci set snmpd.conntrack.args='-c "wc -l /proc/net/nf_conntrack | cut -f 1 -s -d \" \""'
 
+# --- conntrack offload breakdown --------------------------------------
+# conntrack flags carry the offload state: [HW_OFFLOAD] = hw nat (MT7981
+# PPE / MT7621 HNAT alike), [OFFLOAD] without HW = sw flow offload.
+# Bare integers for LibreNMS Custom OID (GAUGE). The grep|wc -l shape
+# always prints one number and exits 0, even at zero matches.
+uci -q delete snmpd.conntrack_hw
+uci set snmpd.conntrack_hw=extend
+uci set snmpd.conntrack_hw.name='conntrack_hw'
+uci set snmpd.conntrack_hw.prog='/bin/sh'
+uci set snmpd.conntrack_hw.args='-c "grep HW_OFFLOAD /proc/net/nf_conntrack 2>/dev/null | wc -l"'
+
+uci -q delete snmpd.conntrack_sw
+uci set snmpd.conntrack_sw=extend
+uci set snmpd.conntrack_sw.name='conntrack_sw'
+uci set snmpd.conntrack_sw.prog='/bin/sh'
+uci set snmpd.conntrack_sw.args='-c "grep OFFLOAD /proc/net/nf_conntrack 2>/dev/null | grep -v HW_OFFLOAD | wc -l"'
+
+# permille, not percent: Custom OID has no floats, so hw*1000/total.
+uci -q delete snmpd.conntrack_hw_permille
+uci set snmpd.conntrack_hw_permille=extend
+uci set snmpd.conntrack_hw_permille.name='conntrack_hw_permille'
+uci set snmpd.conntrack_hw_permille.prog='/bin/sh'
+uci set snmpd.conntrack_hw_permille.args='-c "t=$(wc -l < /proc/net/nf_conntrack 2>/dev/null);h=$(grep HW_OFFLOAD /proc/net/nf_conntrack 2>/dev/null | wc -l);echo $((h*1000/(t>0?t:1)))"'
+
 uci -q delete snmpd.hardware
 uci set snmpd.hardware=extend
 uci set snmpd.hardware.name='hardware'
