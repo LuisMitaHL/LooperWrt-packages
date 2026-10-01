@@ -29,7 +29,7 @@ define Package/snmpd-defaults/description
  LooperWrt defaults for the net-snmp daemon, useful on their own without any
  LibreNMS or wireless pieces: the LooperWrt agent port and read community,
  location/contact, and the always-available extends (temperature,
- conntrack + hw/sw offload breakdown, hardware).
+ conntrack + hw/sw offload breakdown, DHCP live sessions, hardware).
 
  Uses replace semantics: the stock UDP:161 listener and the stock "public"
  read community are dropped so that only UDP:16161 and the LooperWrt

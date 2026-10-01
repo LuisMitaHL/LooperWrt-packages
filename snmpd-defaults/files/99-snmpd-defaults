@@ -71,6 +71,27 @@ uci set snmpd.conntrack_hw_permille.name='conntrack_hw_permille'
 uci set snmpd.conntrack_hw_permille.prog='/bin/sh'
 uci set snmpd.conntrack_hw_permille.args='-c "t=$(wc -l < /proc/net/nf_conntrack 2>/dev/null);h=$(grep HW_OFFLOAD /proc/net/nf_conntrack 2>/dev/null | wc -l);echo $((h*1000/(t>0?t:1)))"'
 
+# --- DHCP live sessions -------------------------------------------------
+# Live (unexpired) lease counts, not raw line counts: dnsmasq keeps
+# /tmp/dhcp.leases and odhcpd keeps /tmp/odhcpd.leases after expiry, so a
+# bare wc -l overcounts. dnsmasq format is "<expiry> <mac> <ip> ...";
+# odhcpd format is "# <iface> <duid> <tok> <host> <expiry> ...".
+# Quoting constraint: args pass through the snmpd.conf parser before
+# /bin/sh, which eats backslashes and nested quotes (an awk '$1>n'
+# program arrives broken and yields 0). So plain shell loops only, no
+# backslashes, no nested quotes. Bare integers, always exit 0.
+uci -q delete snmpd.dhcp_leases
+uci set snmpd.dhcp_leases=extend
+uci set snmpd.dhcp_leases.name='dhcp_leases'
+uci set snmpd.dhcp_leases.prog='/bin/sh'
+uci set snmpd.dhcp_leases.args='-c "n=$(date +%s);c=0;while read e r; do [ $e -gt $n ] 2>/dev/null && c=$((c+1)); done 2>/dev/null </tmp/dhcp.leases;echo $c"'
+
+uci -q delete snmpd.dhcp6_leases
+uci set snmpd.dhcp6_leases=extend
+uci set snmpd.dhcp6_leases.name='dhcp6_leases'
+uci set snmpd.dhcp6_leases.prog='/bin/sh'
+uci set snmpd.dhcp6_leases.args='-c "n=$(date +%s);k=0;while read a b c d e x r; do [ $x -gt $n ] 2>/dev/null && k=$((k+1)); done 2>/dev/null </tmp/odhcpd.leases;echo $k"'
+
 uci -q delete snmpd.hardware
 uci set snmpd.hardware=extend
 uci set snmpd.hardware.name='hardware'
