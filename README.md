@@ -15,7 +15,7 @@ src-git looperwrt https://github.com/LuisMitaHL/LooperWrt-packages.git;main
 | `luci-app-antilag` | 1.0.0 | LuCI UI for antilag (menu.d, rpcd ACL, JS views, `es` lmo). `DEPENDS +antilag`. |
 | `tailscale-route-watchdog` | 0.1 | Self-healing watchdog for Tailscale policy routing (table 52). Aurora core only. |
 | `mwan3-bootfix` | 0.1 | One-shot delayed `mwan3 restart` after boot. Core only. |
-| `snmpd-defaults` | 1.0.0 | LooperWrt snmpd defaults (agent `UDP:16161`, `access_default` community, location/contact, temperature/conntrack+PPE-offload/DHCP-live/hardware extends). Conntrack OIDs are served by `/usr/sbin/snmpd-conntrack` from O(1) sources (kernel conntrack counter, PPE/FOE bound entries) — never a full `/proc/net/nf_conntrack` scan. Applied by `/etc/uci-defaults`, **replace** semantics: drops stock `UDP:161` and the stock `public` community. `DEPENDS +snmpd-nossl`. |
+| `snmpd-defaults` | 1.0.0 | LooperWrt snmpd defaults (agent `UDP:16161`, `access_default` community, location/contact, temperature/conntrack+PPE-offload/DHCP-live/hardware extends). Conntrack OIDs are 5-min rolling means served by `/usr/sbin/snmpd-conntrack` from O(1) sources (kernel conntrack counter, PPE/FOE bound entries), sampled every 30 s by the `snmpd-ctavg` procd service into `/tmp` — never a full `/proc/net/nf_conntrack` scan. Applied by `/etc/uci-defaults`, **replace** semantics: drops stock `UDP:161` and the stock `public` community. `DEPENDS +snmpd-nossl`. |
 | `snmpd-librenms` | 1.0.0 | LibreNMS OpenWrt agent + dynamic wireless extends. Fetches the collector scripts at build time from a pinned `librenms/librenms-agent` commit. A procd service watches hostapd `bss.add`/`bss.remove` and reconciles `/etc/config/snmpd` + `/etc/librenms/wlInterfaces.txt` (band+SSID names) only when the AP set changes. `DEPENDS +snmpd-defaults +iw +iwinfo`. |
 | `net-snmp` | 5.9.4-7 | **Override** of `packages/net/net-snmp` (stock 5.9.4-6). Only deltas: `PKG_RELEASE` 6→7 and `--with-persistent-directory=/tmp/snmp/` (tmpfs, avoids flash wear; stock uses `/usr/lib/snmp/`). Rebase procedure below. |
 | `tailscale` | 1.102.4 | **Override** of `packages/net/tailscale` (newer upstream than the stock 25.12 feed copy). Upstream-tracked version: never HEAD-stamped. Migrated from the in-tree `package/net/tailscale` on `openwrt-25.12-aurora`. |
@@ -111,6 +111,15 @@ Extend cost (the agent is synchronous):
   entries, so ~10% above the old `wc -l`), `hw` from PPE/FOE bound entries
   (`ppe0/bind`, auto-mounts debugfs, `0` when the target has no PPE),
   `permille` derived from both.
+- The conntrack values are **5-minute rolling means**, not instants. The
+  `snmpd-ctavg` procd service samples both O(1) sources every 30 s into
+  `/tmp/snmpd-ctavg.{total,hw}` (`epoch value` lines, pruned >300 s,
+  tmp+mv rewrites); the extends report `sum/count` over the trailing
+  window. LibreNMS polls every 5 min, so a poll-side average would hold a
+  single sample and smooth nothing — the sampler is what makes it work.
+  Readers fall back to the live source when the file is empty (boot) or the
+  newest sample is older than 90 s (sampler dead). Peaks are flattened and
+  values lag ~2.5 min behind live; that is inherent to a 5-min mean.
 - `conntrack_hw` semantics changed: PPE-bound flows now, not the
   `[HW_OFFLOAD]` flag count. The flag outlives the PPE slot and drifts high
   (395 bound vs 3050 flagged at the same instant), so old graphs overstate

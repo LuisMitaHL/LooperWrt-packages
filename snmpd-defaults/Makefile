@@ -11,7 +11,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=snmpd-defaults
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 PKG_MAINTAINER:=Luis Mita <luis@luismita.com>
 PKG_LICENSE:=GPL-2.0-or-later
@@ -34,6 +34,9 @@ define Package/snmpd-defaults/description
  The conntrack extends are served by /usr/sbin/snmpd-conntrack from O(1)
  sources (kernel conntrack counter, PPE/FOE bound entries) instead of
  scanning /proc/net/nf_conntrack, which blocks the snmpd agent for seconds.
+ The reported values are 5-minute rolling means sampled every 30 s by the
+ snmpd-ctavg service (samples in /tmp), so LibreNMS graphs do not jump with
+ the raw counters between 5-min polls.
 
  Uses replace semantics: the stock UDP:161 listener and the stock "public"
  read community are dropped so that only UDP:16161 and the LooperWrt
@@ -50,12 +53,23 @@ fi
 exit 0
 endef
 
+define Package/snmpd-defaults/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+/etc/init.d/snmpd-ctavg stop >/dev/null 2>&1
+/etc/init.d/snmpd-ctavg disable >/dev/null 2>&1
+rm -f /tmp/snmpd-ctavg.total /tmp/snmpd-ctavg.hw /tmp/snmpd-ctavg.*.new
+exit 0
+endef
+
 define Build/Compile
 endef
 
 define Package/snmpd-defaults/install
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/99-snmpd-defaults $(1)/etc/uci-defaults/99-snmpd-defaults
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/snmpd-ctavg.init $(1)/etc/init.d/snmpd-ctavg
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/snmpd-conntrack $(1)/usr/sbin/snmpd-conntrack
 endef

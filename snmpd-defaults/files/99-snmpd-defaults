@@ -54,6 +54,9 @@ uci set snmpd.temperature.args='/sys/class/thermal/thermal_zone0/temp'
 # MT7981), not the [HW_OFFLOAD] flag in nf_conntrack: that flag outlives the
 # PPE slot and drifts high. conntrack_hw_permille = hw*1000/total (permille,
 # not percent: Custom OID has no floats).
+# All three are 5-minute rolling means: the snmpd-ctavg service samples the
+# sources every 30 s into /tmp and snmpd-conntrack averages the window, so
+# LibreNMS's 5-min polls do not see the raw counters jump around.
 uci -q delete snmpd.conntrack
 uci set snmpd.conntrack=extend
 uci set snmpd.conntrack.name='conntrack'

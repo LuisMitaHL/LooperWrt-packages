@@ -1,20 +1,28 @@
 #!/bin/sh
-# Cheap conntrack metrics for the snmpd extends, backed only by O(1) sources.
+# Conntrack metrics for the snmpd extends: 5-minute rolling means backed by
+# O(1) sources.
+#
+# Rolling mean: LibreNMS polls every 5 min and the raw counters jump hard
+# between polls on a busy NAT (15k conntrack entries churn constantly). The
+# snmpd-ctavg service samples every INTERVAL seconds into /tmp (tmpfs), and
+# the extends report the mean of the trailing WINDOW-second window.
 #
 # Why not read /proc/net/nf_conntrack here: a full read costs ~8-10 s of CPU
-# on MT7621 with ~15k entries (seq_file renders every entry under lock; cost
-# scales with read buffer size, see below), and net-snmp runs extend programs
-# synchronously in the agent loop, so the whole agent goes unresponsive for
-# the duration of the scan. Measured 2026-10-05 on LOR-Accel (RB750Gr3,
-# 6.12, ~15k conntrack): wc -l 7.7 s, grep -c HW_OFFLOAD 13.6 s,
-# "dd bs=131072 | grep -c" 3.6 s, /proc/sys/net/netfilter/nf_conntrack_count
-# 0.00 s, wc -l /sys/kernel/debug/ppe0/bind 0.05 s. A 3-OID SNMP poll cost
-# ~38 s of agent-blocking time before this script.
+# on MT7621 with ~15k entries (seq_file renders every entry under lock), and
+# net-snmp runs extend programs synchronously in the agent loop, so the whole
+# agent goes unresponsive for the scan. Measured 2026-10-05 on LOR-Accel
+# (RB750Gr3, 6.12, ~15k conntrack): wc -l 7.7 s, grep -c HW_OFFLOAD 13.6 s,
+# /proc/sys/net/netfilter/nf_conntrack_count 0.00 s,
+# wc -l /sys/kernel/debug/ppe0/bind 0.05 s.
 #
 # Output contract (LibreNMS Custom OID, GAUGE): one bare integer, exit 0.
 
-case "${1:-}" in
-total)
+WINDOW=300	# averaging window, seconds
+STALE=90	# newest sample older than this: sampler dead, read live
+INTERVAL=30	# sampler cadence, seconds
+STATE=/tmp/snmpd-ctavg
+
+live_total() {
 	# Kernel entry counter, O(1). Counts unconfirmed/dying entries that the
 	# nf_conntrack seq file skips, so it reads ~10% higher than the old
 	# "wc -l /proc/net/nf_conntrack" did. The seq-file fallback is only for
@@ -24,13 +32,14 @@ total)
 	else
 		wc -l < /proc/net/nf_conntrack 2>/dev/null || echo 0
 	fi
-	;;
-hw)
+}
+
+live_hw() {
 	# Flows currently bound in the PPE/FOE table (MT7621 HNAT, MT7981), so
 	# what the switch chip is actually forwarding. This is stricter than
 	# counting [HW_OFFLOAD] flags in nf_conntrack (the flag outlives the PPE
-	# slot: 395 bound vs 3050 flagged at the same instant) and 200x cheaper.
-	# No PPE means no hardware offload, so 0 is the true answer.
+	# slot) and 200x cheaper. No PPE means no hardware offload, so 0 is the
+	# true answer.
 	ppe=/sys/kernel/debug/ppe0/bind
 	if [ ! -r "$ppe" ] && [ -d /sys/kernel/debug ]; then
 		mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
@@ -40,15 +49,79 @@ hw)
 	else
 		echo 0
 	fi
+}
+
+# Mean of the trailing WINDOW seconds of samples. Prints nothing (rc 1) when
+# the file is empty, holds no usable sample, or the newest sample is older
+# than STALE (sampler dead: better live than a frozen average).
+mean() {
+	f="$STATE.$1"
+	[ -s "$f" ] || return 1
+	now=$(date +%s)
+	sum=0
+	n=0
+	newest=0
+	while read -r ts v; do
+		case "$ts$v" in ''|*[!0-9]*) continue ;; esac
+		[ "$ts" -lt $((now-WINDOW)) ] && continue
+		sum=$((sum+v))
+		n=$((n+1))
+		[ "$ts" -gt "$newest" ] && newest=$ts
+	done < "$f"
+	[ "$n" -gt 0 ] || return 1
+	[ $((now-newest)) -le "$STALE" ] || return 1
+	echo $((sum/n))
+}
+
+prune() {
+	# rewrite via tmp+mv: readers never see a half-written file
+	f="$1"
+	now="$2"
+	[ -s "$f" ] || return 0
+	: > "$f.new"
+	while read -r ts v; do
+		case "$ts$v" in ''|*[!0-9]*) continue ;; esac
+		[ "$ts" -lt $((now-WINDOW)) ] && continue
+		echo "$ts $v" >> "$f.new"
+	done < "$f"
+	mv "$f.new" "$f"
+}
+
+sample_once() {
+	now=$(date +%s)
+	t=$(live_total)
+	h=$(live_hw)
+	case "$t" in ''|*[!0-9]*) t=0 ;; esac
+	case "$h" in ''|*[!0-9]*) h=0 ;; esac
+	echo "$now $t" >> "$STATE.total"
+	echo "$now $h" >> "$STATE.hw"
+	prune "$STATE.total" "$now"
+	prune "$STATE.hw" "$now"
+}
+
+case "${1:-}" in
+total)
+	mean total || live_total
+	;;
+hw)
+	mean hw || live_hw
 	;;
 permille)
-	# PPE-bound flows per 1000 conntrack entries. Permille, not percent:
-	# Custom OID has no floats.
-	t=$("$0" total)
-	h=$("$0" hw)
+	# PPE-bound flows per 1000 conntrack entries, from the same means.
+	# Permille, not percent: Custom OID has no floats.
+	t=$(mean total) || t=$(live_total)
+	h=$(mean hw) || h=$(live_hw)
 	case "$t" in ''|*[!0-9]*) t=0 ;; esac
 	case "$h" in ''|*[!0-9]*) h=0 ;; esac
 	echo $((h*1000/(t>0?t:1)))
+	;;
+loop)
+	# Sampler: one sample per INTERVAL, forever. procd (snmpd-ctavg
+	# service) owns exactly one instance; the first sample lands at start.
+	while :; do
+		sample_once
+		sleep "$INTERVAL"
+	done
 	;;
 *)
 	echo 0
