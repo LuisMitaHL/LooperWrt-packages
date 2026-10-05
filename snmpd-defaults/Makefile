@@ -11,7 +11,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=snmpd-defaults
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_MAINTAINER:=Luis Mita <luis@luismita.com>
 PKG_LICENSE:=GPL-2.0-or-later
@@ -29,7 +29,11 @@ define Package/snmpd-defaults/description
  LooperWrt defaults for the net-snmp daemon, useful on their own without any
  LibreNMS or wireless pieces: the LooperWrt agent port and read community,
  location/contact, and the always-available extends (temperature,
- conntrack + hw/sw offload breakdown, DHCP live sessions, hardware).
+ conntrack + PPE offload breakdown, DHCP live sessions, hardware).
+
+ The conntrack extends are served by /usr/sbin/snmpd-conntrack from O(1)
+ sources (kernel conntrack counter, PPE/FOE bound entries) instead of
+ scanning /proc/net/nf_conntrack, which blocks the snmpd agent for seconds.
 
  Uses replace semantics: the stock UDP:161 listener and the stock "public"
  read community are dropped so that only UDP:16161 and the LooperWrt
@@ -52,6 +56,8 @@ endef
 define Package/snmpd-defaults/install
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/99-snmpd-defaults $(1)/etc/uci-defaults/99-snmpd-defaults
+	$(INSTALL_DIR) $(1)/usr/sbin
+	$(INSTALL_BIN) ./files/snmpd-conntrack $(1)/usr/sbin/snmpd-conntrack
 endef
 
 $(eval $(call BuildPackage,snmpd-defaults))

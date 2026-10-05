@@ -15,7 +15,7 @@ src-git looperwrt https://github.com/LuisMitaHL/LooperWrt-packages.git;main
 | `luci-app-antilag` | 1.0.0 | LuCI UI for antilag (menu.d, rpcd ACL, JS views, `es` lmo). `DEPENDS +antilag`. |
 | `tailscale-route-watchdog` | 0.1 | Self-healing watchdog for Tailscale policy routing (table 52). Aurora core only. |
 | `mwan3-bootfix` | 0.1 | One-shot delayed `mwan3 restart` after boot. Core only. |
-| `snmpd-defaults` | 1.0.0 | LooperWrt snmpd defaults (agent `UDP:16161`, `access_default` community, location/contact, temperature/conntrack+offload/DHCP-live/hardware extends). Applied by `/etc/uci-defaults`, **replace** semantics: drops stock `UDP:161` and the stock `public` community. `DEPENDS +snmpd-nossl`. |
+| `snmpd-defaults` | 1.0.0 | LooperWrt snmpd defaults (agent `UDP:16161`, `access_default` community, location/contact, temperature/conntrack+PPE-offload/DHCP-live/hardware extends). Conntrack OIDs are served by `/usr/sbin/snmpd-conntrack` from O(1) sources (kernel conntrack counter, PPE/FOE bound entries) — never a full `/proc/net/nf_conntrack` scan. Applied by `/etc/uci-defaults`, **replace** semantics: drops stock `UDP:161` and the stock `public` community. `DEPENDS +snmpd-nossl`. |
 | `snmpd-librenms` | 1.0.0 | LibreNMS OpenWrt agent + dynamic wireless extends. Fetches the collector scripts at build time from a pinned `librenms/librenms-agent` commit. A procd service watches hostapd `bss.add`/`bss.remove` and reconciles `/etc/config/snmpd` + `/etc/librenms/wlInterfaces.txt` (band+SSID names) only when the AP set changes. `DEPENDS +snmpd-defaults +iw +iwinfo`. |
 | `net-snmp` | 5.9.4-7 | **Override** of `packages/net/net-snmp` (stock 5.9.4-6). Only deltas: `PKG_RELEASE` 6→7 and `--with-persistent-directory=/tmp/snmp/` (tmpfs, avoids flash wear; stock uses `/usr/lib/snmp/`). Rebase procedure below. |
 | `tailscale` | 1.102.4 | **Override** of `packages/net/tailscale` (newer upstream than the stock 25.12 feed copy). Upstream-tracked version: never HEAD-stamped. Migrated from the in-tree `package/net/tailscale` on `openwrt-25.12-aurora`. |
@@ -92,6 +92,30 @@ UCI / config:
   changed (`snmpd-librenms-sync` does). Symptom of getting this wrong: the
   config file shows the extends but `snmpwalk ... 1.3.6.1.4.1.8072.1.3.2.2.1.2`
   lists only the handful the daemon started with.
+
+Extend cost (the agent is synchronous):
+
+- net-snmp runs `extend`/`exec` programs **in the agent loop**: while one
+  runs, the daemon answers nothing, and the poller sees `Timeout: No
+  Response` and retries. An expensive extend costs the whole agent, not just
+  CPU.
+- A full read of `/proc/net/nf_conntrack` is the classic trap. Measured
+  2026-10-05 on LOR-Accel (RB750Gr3, 6.12, ~15k conntrack):
+  `wc -l` 7.7 s, `grep -c HW_OFFLOAD` 13.6 s, `dd bs=131072 | grep -c`
+  3.6 s (kernel seq_file cost scales with read buffer size),
+  `/proc/sys/net/netfilter/nf_conntrack_count` 0.00 s,
+  `wc -l /sys/kernel/debug/ppe0/bind` 0.05 s. The old 3-OID conntrack poll
+  blocked the agent ~38 s.
+- Rule: an extend may read O(1) files only. `/usr/sbin/snmpd-conntrack` is
+  the pattern — `total` from the sysctl counter (incl. unconfirmed/dying
+  entries, so ~10% above the old `wc -l`), `hw` from PPE/FOE bound entries
+  (`ppe0/bind`, auto-mounts debugfs, `0` when the target has no PPE),
+  `permille` derived from both.
+- `conntrack_hw` semantics changed: PPE-bound flows now, not the
+  `[HW_OFFLOAD]` flag count. The flag outlives the PPE slot and drifts high
+  (395 bound vs 3050 flagged at the same instant), so old graphs overstate
+  hw offload. `conntrack_sw` was dropped entirely (only visible in a full
+  scan); remove its Custom OID in LibreNMS.
 
 Dynamic trigger:
 

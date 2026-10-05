@@ -41,35 +41,40 @@ uci set snmpd.temperature.name='temperature'
 uci set snmpd.temperature.prog='/bin/cat'
 uci set snmpd.temperature.args='/sys/class/thermal/thermal_zone0/temp'
 
+# --- conntrack + PPE offload -------------------------------------------
+# All three go through /usr/sbin/snmpd-conntrack and must stay backed by
+# O(1) sources: a full read of /proc/net/nf_conntrack costs ~8-10 s of CPU
+# on MT7621 with ~15k entries, and net-snmp runs extend programs
+# synchronously in the agent loop, so the whole agent goes unresponsive for
+# the scan (SNMP walks of the extend table time out and the poller retries).
+# Bare integers for LibreNMS Custom OID (GAUGE).
+# conntrack = kernel entry counter (includes unconfirmed/dying entries the
+# seq file skips, so it reads ~10% higher than the old wc -l did).
+# conntrack_hw = flows bound in the PPE/FOE table right now (MT7621 HNAT /
+# MT7981), not the [HW_OFFLOAD] flag in nf_conntrack: that flag outlives the
+# PPE slot and drifts high. conntrack_hw_permille = hw*1000/total (permille,
+# not percent: Custom OID has no floats).
 uci -q delete snmpd.conntrack
 uci set snmpd.conntrack=extend
 uci set snmpd.conntrack.name='conntrack'
-uci set snmpd.conntrack.prog='/bin/sh'
-uci set snmpd.conntrack.args='-c "wc -l /proc/net/nf_conntrack | cut -f 1 -s -d \" \""'
+uci set snmpd.conntrack.prog='/usr/sbin/snmpd-conntrack'
+uci set snmpd.conntrack.args='total'
 
-# --- conntrack offload breakdown --------------------------------------
-# conntrack flags carry the offload state: [HW_OFFLOAD] = hw nat (MT7981
-# PPE / MT7621 HNAT alike), [OFFLOAD] without HW = sw flow offload.
-# Bare integers for LibreNMS Custom OID (GAUGE). The grep|wc -l shape
-# always prints one number and exits 0, even at zero matches.
 uci -q delete snmpd.conntrack_hw
 uci set snmpd.conntrack_hw=extend
 uci set snmpd.conntrack_hw.name='conntrack_hw'
-uci set snmpd.conntrack_hw.prog='/bin/sh'
-uci set snmpd.conntrack_hw.args='-c "grep HW_OFFLOAD /proc/net/nf_conntrack 2>/dev/null | wc -l"'
+uci set snmpd.conntrack_hw.prog='/usr/sbin/snmpd-conntrack'
+uci set snmpd.conntrack_hw.args='hw'
 
-uci -q delete snmpd.conntrack_sw
-uci set snmpd.conntrack_sw=extend
-uci set snmpd.conntrack_sw.name='conntrack_sw'
-uci set snmpd.conntrack_sw.prog='/bin/sh'
-uci set snmpd.conntrack_sw.args='-c "grep OFFLOAD /proc/net/nf_conntrack 2>/dev/null | grep -v HW_OFFLOAD | wc -l"'
-
-# permille, not percent: Custom OID has no floats, so hw*1000/total.
 uci -q delete snmpd.conntrack_hw_permille
 uci set snmpd.conntrack_hw_permille=extend
 uci set snmpd.conntrack_hw_permille.name='conntrack_hw_permille'
-uci set snmpd.conntrack_hw_permille.prog='/bin/sh'
-uci set snmpd.conntrack_hw_permille.args='-c "t=$(wc -l < /proc/net/nf_conntrack 2>/dev/null);h=$(grep HW_OFFLOAD /proc/net/nf_conntrack 2>/dev/null | wc -l);echo $((h*1000/(t>0?t:1)))"'
+uci set snmpd.conntrack_hw_permille.prog='/usr/sbin/snmpd-conntrack'
+uci set snmpd.conntrack_hw_permille.args='permille'
+
+# conntrack_sw is gone: sw flow-offload entries were only visible in a full
+# nf_conntrack scan. Remove the old section on upgrade.
+uci -q delete snmpd.conntrack_sw
 
 # --- DHCP live sessions -------------------------------------------------
 # Live (unexpired) lease counts, not raw line counts: dnsmasq keeps
