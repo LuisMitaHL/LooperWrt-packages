@@ -20,11 +20,12 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   `snmpd-librenms` pins its upstream download in `PKG_SOURCE_VERSION`, never
   in `PKG_VERSION`; `dhcpoptinj` follows the same rule (HTTPS git pin at
   `https://github.com/LuisMitaHL/dhcpoptinj`).
-- `dhcpoptinj` and `ap-isolation` are vendor copies of the package roots of
-  `LuisMitaHL/dhcpoptinj-openwrt` (deprecated) and
-  `LuisMitaHL/openwrt-public-ap-isolation` — this feed is the build source of
-  truth; sync from those repos when they change. Both are selected on every
-  `ap` profile via `configs/ap.config` in the builder.
+- `dhcpoptinj` and `ap-isolation` pin their sources from upstream git repos
+  (`dhcpoptinj` from `LuisMitaHL/dhcpoptinj`; `ap-isolation` from
+  `LuisMitaHL/openwrt-public-ap-isolation`, whose repo root is the package
+  root). This feed is the build recipe; bump `PKG_SOURCE_VERSION` in the feed
+  Makefile when those repos change. Both are selected on every `ap` profile via
+  `configs/ap.config` in the builder.
 - `ap-network-defaults` is feed-native (no vendor repo): the uci-defaults
   script `zz-ap-network-defaults` converting ap images to dumb-AP networking
   (all physical ports → br-lan, wan iface removed, lan as DHCP client,
