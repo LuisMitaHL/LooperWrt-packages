@@ -16,7 +16,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/LuisMitaHL/openwrt-public-ap-isolation
 PKG_SOURCE_DATE:=2026-10-08
-PKG_SOURCE_VERSION:=a52cd9d6187b63f34b1b2cf87d1bf063ff1a5da8
+PKG_SOURCE_VERSION:=c303800e06899a6a3f51a50a7180540e98608f05
 
 PKG_MIRROR_HASH:=skip
 
@@ -63,4 +63,30 @@ define Package/ap-isolation/install
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/etc/hotplug.d/net/50-ap-isolation $(1)/etc/hotplug.d/net/50-ap-isolation
 endef
 
+# qca8k-specific add-on, selected per device (only where the qca8k switch
+# driver is used, e.g. configs/target-ipq40xx.config). Ships disabled.
+define Package/ap-isolation-fdb
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=qca8k stale-ATU roaming workaround (ap-isolation add-on)
+  DEPENDS:=+ap-isolation +iw
+endef
+
+define Package/ap-isolation-fdb/description
+  Opt-in workaround for the qca8k stale-ATU roaming blackhole
+  (openwrt/openwrt#25365). Pins a static bridge FDB entry on a station's
+  wireless interface at association and removes it on disassociation, which
+  purges the stale hardware ATU entry left on the wired uplink after a roam.
+  Disabled by default: set ap-isolation.settings.fdb_workaround='1'. Only
+  meaningful on qca8k targets; select it explicitly per device.
+endef
+
+define Package/ap-isolation-fdb/install
+	$(INSTALL_DIR) $(1)/usr/sbin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/usr/sbin/ap-isolation-fdb $(1)/usr/sbin/ap-isolation-fdb
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/etc/init.d/ap-isolation-fdb $(1)/etc/init.d/ap-isolation-fdb
+endef
+
 $(eval $(call BuildPackage,ap-isolation))
+$(eval $(call BuildPackage,ap-isolation-fdb))

@@ -25,7 +25,9 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   `LuisMitaHL/openwrt-public-ap-isolation`, whose repo root is the package
   root). This feed is the build recipe; bump `PKG_SOURCE_VERSION` in the feed
   Makefile when those repos change. Both are selected on every `ap` profile via
-  `configs/ap.config` in the builder.
+  `configs/ap.config` in the builder. The `ap-isolation` Makefile also defines
+  the qca8k-only `ap-isolation-fdb` add-on (stale-ATU roaming workaround),
+  selected only in `configs/target-ipq40xx.config` and disabled by default.
 - `ap-network-defaults` is feed-native (no vendor repo): the uci-defaults
   script `zz-ap-network-defaults` converting ap images to dumb-AP networking
   (all physical ports → br-lan, wan iface removed, lan as DHCP client,
