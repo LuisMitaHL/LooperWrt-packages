@@ -28,6 +28,7 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   `configs/ap.config` in the builder. The `ap-isolation` Makefile also defines
   the qca8k-only `ap-isolation-fdb` add-on (stale-ATU roaming workaround),
   selected only in `configs/target-ipq40xx.config` and disabled by default.
+- `fullconenat-nft` is a **kernel package**: it has no `PKG_VERSION`, so it is never HEAD-stamped and is not in `LOOPERWRT_PKGS`. The builder verifies it separately (`LOOPERWRT_NOVERSION_PKGS` in `verify_fullcone_carry`). It is selected only on `core`/`core_lite`; the package's `files/95-fullcone` uci-defaults enables `firewall.@defaults[0].fullcone` when unset. Do not add a LuCI app or patch `luci-app-firewall` for it: the option survives LuCI edits (delta-based UCI save) but is intentionally invisible; the UCI command is documented.
 - `ap-network-defaults` is feed-native (no vendor repo): the uci-defaults
   script `zz-ap-network-defaults` converting ap images to dumb-AP networking
   (all physical ports → br-lan, wan iface removed, lan as DHCP client,

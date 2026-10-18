@@ -1,0 +1,21 @@
+#!/bin/sh
+# First-boot / upgrade default for the fullcone NAT kmod.
+#
+# The option lives in /etc/config/firewall so fw4 reads it. LuCI's firewall
+# page only writes the options it knows about (uci.js submits state.changes),
+# so an unknown `fullcone` option is preserved when the user edits the page.
+# If the option is absent (fresh image or a pre-fullcone /etc/config/firewall
+# kept by sysupgrade), enable it here. An explicit `option fullcone 0` is
+# respected and never overwritten.
+#
+# This package is selected on router profiles only, so AP images neither ship
+# the script nor probe the missing expression.
+
+[ -x /sbin/fw4 ] || exit 0
+uci -q get firewall.@defaults[0] >/dev/null 2>&1 || exit 0
+uci -q get firewall.@defaults[0].fullcone >/dev/null 2>&1 || {
+	uci set firewall.@defaults[0].fullcone='1'
+	uci commit firewall
+}
+
+exit 0
