@@ -26,8 +26,9 @@ define Package/ap-network-defaults/description
   First-boot (uci-defaults) conversion of an ap-profile image into dumb-AP
   networking: every physical port becomes a br-lan port and the wan
   interface is removed, lan switches to a DHCP client, the DHCPv4, DHCPv6
-  and RA servers are turned off (dnsmasq keeps serving DNS) and antilag is
-  disabled because no L3 uplink remains to shape. Apply-once, guarded by
+  and RA servers are turned off when the server packages are installed (ap_lite
+  ships none), and antilag is disabled when installed because no L3 uplink
+  remains to shape. Apply-once, guarded by
   the looperwrt.ap_netdefaults marker like the branch 99_*-defaults.
 endef
 

@@ -9,8 +9,10 @@
 # Result on a fresh install:
 #   * every physical port is a br-lan port, the wan interface is gone
 #   * lan is a DHCP client (its address comes from the network's router)
-#   * DHCPv4, DHCPv6 and RA servers are off; dnsmasq keeps serving DNS
-#   * antilag is disabled: there is no L3 uplink left to shape
+#   * DHCPv4, DHCPv6 and RA servers are off where the server packages are
+#     installed. ap_lite does not install dnsmasq/odhcpd at all, so there is
+#     no /etc/config/dhcp and this block is a no-op there.
+#   * antilag is disabled (if installed): there is no L3 uplink left to shape
 
 if uci -q get looperwrt.ap_netdefaults.applied >/dev/null; then
 	exit 0
@@ -112,10 +114,12 @@ while :; do
 	[ -z "$kill" ] && break
 done
 
-# --- 6. DHCPv4, DHCPv6 and RA servers fully off -----------------------------
+# --- 6. DHCPv4, DHCPv6 and RA servers fully off (when installed) ----------
 # ignore=1 stops dnsmasq's DHCPv4; odhcpd parses ra/dhcpv6/ndp/dhcpv4 as
 # "disabled" (parse_mode in its config.c) and keeps iface->ignore=true when
-# no mode is != disabled. The section stays so LuCI can re-enable it.
+# no mode is != disabled. The section stays so LuCI can re-enable it. On
+# ap_lite there is no /etc/config/dhcp: the loop is empty and the commit is
+# skipped below.
 for s in $(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dhcp$/\1/p'); do
 	uci -q set "dhcp.$s.ignore=1"
 	uci -q set "dhcp.$s.ra=disabled"
@@ -123,7 +127,9 @@ for s in $(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dhcp$/\1/p'); do
 	uci -q set "dhcp.$s.ndp=disabled"
 	uci -q set "dhcp.$s.dhcpv4=disabled"
 done
-uci -q commit dhcp
+# ap_lite ships no DHCP/DNS server packages, so /etc/config/dhcp may not
+# exist; do not create an empty config just to commit it.
+[ -f /etc/config/dhcp ] && uci -q commit dhcp
 
 # --- 7. antilag has no L3 uplink to shape on a dumb AP ----------------------
 if [ -f /etc/config/antilag ]; then
