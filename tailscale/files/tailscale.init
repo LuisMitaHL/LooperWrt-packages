@@ -21,6 +21,34 @@ start_service() {
   config_get state_file "settings" state_file /etc/tailscale/tailscaled.state
   config_get fw_mode "settings" fw_mode nftables
   config_get gomemlimit "settings" gomemlimit 90MiB
+  config_get netmap_cache "settings" netmap_cache ram
+
+  # Netmap cache placement. tailscaled v1.104 has no cache-dir flag of its
+  # own: it derives the cache from the state file's directory (varRoot
+  # /etc/tailscale -> profile-data/<profileID>/netmap-cache, see
+  # ipn/ipnlocal/diskcache.go). 'ram' symlinks that directory onto tmpfs so
+  # the per-peer / per-netmap rewrites never touch the flash overlay -- the
+  # cache is disposable and only needs to outlive a tailscaled respawn, not a
+  # reboot. 'off' keeps the tmpfs symlink (the home-DERP write path is NOT
+  # gated by the env knob in 1.104.1) and disables the cache in tailscaled.
+  # 'flash' leaves upstream behaviour, for anyone who wants to survive a
+  # reboot with the control plane unreachable.
+  #
+  # The tmpfs target must exist BEFORE tailscaled runs: os.MkdirAll on a
+  # dangling symlink fails with EEXIST, which would silently leave the cache
+  # off. The [ ! -L ] guard keeps /etc writes to the first boot only.
+  case "$netmap_cache" in
+    flash)
+      [ -L /etc/tailscale/profile-data ] && rm -f /etc/tailscale/profile-data
+      ;;
+    *)
+      mkdir -p /etc/tailscale /tmp/tailscale-profile-data
+      if [ ! -L /etc/tailscale/profile-data ]; then
+        rm -rf /etc/tailscale/profile-data   # disposable cache (flash -> ram)
+        ln -sfn /tmp/tailscale-profile-data /etc/tailscale/profile-data
+      fi
+      ;;
+  esac
 
   /usr/sbin/tailscaled --cleanup
 
@@ -42,6 +70,13 @@ start_service() {
   # uci-defaults is the single source of that value.
   procd_append_param env GOGC=20
   procd_append_param env GOMEMLIMIT="$gomemlimit"
+
+  # Netmap caching opt-out (uci tailscale.settings.netmap_cache='off').
+  # TS_USE_CACHED_NETMAP is a hidden envknob defaulting to true; 'false'
+  # makes tailscaled discard the cache and skip both the write and the load
+  # path. Note the tailnet's 'disable-cache-network-maps' node attribute is
+  # NOT honoured by 1.104.1, so this is the only local switch there is.
+  [ "$netmap_cache" = off ] && procd_append_param env TS_USE_CACHED_NETMAP=false
 
   # Set the port to listen on for incoming VPN packets.
   # Remote nodes will automatically be informed about the new port number,
