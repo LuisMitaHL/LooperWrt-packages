@@ -40,7 +40,8 @@ GO_PKG_LDFLAGS_X:=tailscale.com/version.shortStamp=$(PKG_VERSION)
 # Generated with the upstream resolver (regenerate on every version bump —
 # never hand-edit, tags drift between releases):
 #   go run ./cmd/featuretags --min --add=cli,osrouter,advertiseroutes,advertiseexitnode,useroutes,useexitnode,dns,portmapper,cachenetmap,health,unixsocketidentity,ipnbus,dnsresolvecache
-# (then strip ts_omit_debug again, see NOTE below — featuretags --min emits it).
+# (then strip ts_omit_debug again, see NOTE below — featuretags --min emits
+# it — and keep netstack: see the QUAD-100 NOTE below).
 # Kept on purpose: headscale OIDC login (--login-server), subnet routers,
 # exit nodes, --advertise-tags, MagicDNS/DNS config, NAT-PMP/UPnP for
 # port forwards, unix socket LocalAPI identity, and persistent
@@ -55,14 +56,34 @@ GO_PKG_LDFLAGS_X:=tailscale.com/version.shortStamp=$(PKG_VERSION)
 # daemon also skips registering /localapi/v0/watch-ipn-bus, the stream
 # that surfaces AuthURL. Upstream bug, open; cost of keeping it is ~0
 # (gate is a const bool + one localapi route).
-# Dropped: ts ssh, serve/funnel (+netstack via dep), iptables (fw4=nftables
+# Dropped: ts ssh, serve/funnel, iptables (fw4=nftables
 # only), bakedroots (ca-bundle already a hard dep), logtail/netlog (TS_NO_LOGS_NO_SUPPORT),
 # self-update, cloud/NAS integrations, taildrop, tap, tpm.
 # NOTE: ts_omit_debug is deliberately NOT set — ipn/localapi/debug.go
 # (gated !ts_omit_debug) serves "current-netmap" and "force-netmap-update",
 # which tailscale-route-watchdog's `tailscale debug netmap|force-netmap-update`
 # heal path depends on.
-GO_PKG_TAGS:=ts_include_cli,ts_omit_ace,ts_omit_acme,ts_omit_androidbin,ts_omit_androiddns,ts_omit_appconnectors,ts_omit_aws,ts_omit_bakedroots,ts_omit_bird,ts_omit_captiveportal,ts_omit_capture,ts_omit_cliconndiag,ts_omit_clientmetrics,ts_omit_clientupdate,ts_omit_cloud,ts_omit_colorable,ts_omit_completion,ts_omit_completion_scripts,ts_omit_conn25,ts_omit_connreject,ts_omit_dbus,ts_omit_debugeventbus,ts_omit_debugportmapper,ts_omit_desktop_sessions,ts_omit_doctor,ts_omit_drive,ts_omit_favorites,ts_omit_flashappliance,ts_omit_gro,ts_omit_hujsonconf,ts_omit_identityfederation,ts_omit_iptables,ts_omit_kube,ts_omit_linkspeed,ts_omit_linuxdnsfight,ts_omit_listenrawdisco,ts_omit_logtail,ts_omit_netlog,ts_omit_netstack,ts_omit_networkmanager,ts_omit_oauthkey,ts_omit_outboundproxy,ts_omit_portlist,ts_omit_posture,ts_omit_qrcodes,ts_omit_relayserver,ts_omit_remoteconfig,ts_omit_resolved,ts_omit_routecheck,ts_omit_runtimemetrics,ts_omit_sdnotify,ts_omit_serve,ts_omit_serviceclientprefs,ts_omit_ssh,ts_omit_synology,ts_omit_syslog,ts_omit_syspolicy,ts_omit_systray,ts_omit_taildrop,ts_omit_tailnetlock,ts_omit_tap,ts_omit_tpm,ts_omit_tundevstats,ts_omit_useproxy,ts_omit_usermetrics,ts_omit_wakeonlan,ts_omit_webbrowser,ts_omit_webclient
+# NOTE: netstack deliberately NOT omitted (featuretags --min emits it as a
+# dep of serve, which stays omitted — the hooks it feeds are optional and
+# `cmd/tailscaled/deps_test.go` has no cross-constraint). QUAD-100: on Linux
+# tailscaled installs a 100.100.100.100/32 route on tailscale0
+# (ipn/ipnlocal/local.go, roundRoutes), and the ONLY piece that terminates
+# traffic to that service IP is wgengine/netstack's handleLocalPackets —
+# it absorbs the packet and hands UDP/53 to dns.Manager.Query (and TCP
+# 53/80 to the DNS/HTTP handlers); the resolver never binds a socket of
+# its own. With ts_omit_netstack the packet falls through to wireguard-go,
+# where no peer owns quad-100, and is dropped silently — `dig
+# @100.100.100.100` on the router dies with a conntrack "no associated
+# peer node" log line. This is exactly tailscale's own comment on the
+# code path. Re-enabling netstack does NOT imply `--accept-dns`: with
+# accept-dns=false the OS config stays trivial (no resolv.conf rewrite)
+# while the internal resolver still answers tailnet names from the live
+# per-node index (ipnlocal wires magicDNSHosts{b} unconditionally when
+# buildfeatures.HasDNS, and tsdns consults it before any other source);
+# MagicDNS just needs to be enabled tailnet-side. Cost: +2.56 MB raw arm64
+# binary (-s -w), ~+1 MB compressed apk; the mt7621/core_lite images take
+# the same build (more userspace buffers under netstack traffic).
+GO_PKG_TAGS:=ts_include_cli,ts_omit_ace,ts_omit_acme,ts_omit_androidbin,ts_omit_androiddns,ts_omit_appconnectors,ts_omit_aws,ts_omit_bakedroots,ts_omit_bird,ts_omit_captiveportal,ts_omit_capture,ts_omit_cliconndiag,ts_omit_clientmetrics,ts_omit_clientupdate,ts_omit_cloud,ts_omit_colorable,ts_omit_completion,ts_omit_completion_scripts,ts_omit_conn25,ts_omit_connreject,ts_omit_dbus,ts_omit_debugeventbus,ts_omit_debugportmapper,ts_omit_desktop_sessions,ts_omit_doctor,ts_omit_drive,ts_omit_favorites,ts_omit_flashappliance,ts_omit_gro,ts_omit_hujsonconf,ts_omit_identityfederation,ts_omit_iptables,ts_omit_kube,ts_omit_linkspeed,ts_omit_linuxdnsfight,ts_omit_listenrawdisco,ts_omit_logtail,ts_omit_netlog,ts_omit_networkmanager,ts_omit_oauthkey,ts_omit_outboundproxy,ts_omit_portlist,ts_omit_posture,ts_omit_qrcodes,ts_omit_relayserver,ts_omit_remoteconfig,ts_omit_resolved,ts_omit_routecheck,ts_omit_runtimemetrics,ts_omit_sdnotify,ts_omit_serve,ts_omit_serviceclientprefs,ts_omit_ssh,ts_omit_synology,ts_omit_syslog,ts_omit_syspolicy,ts_omit_systray,ts_omit_taildrop,ts_omit_tailnetlock,ts_omit_tap,ts_omit_tpm,ts_omit_tundevstats,ts_omit_useproxy,ts_omit_usermetrics,ts_omit_wakeonlan,ts_omit_webbrowser,ts_omit_webclient
 
 include $(INCLUDE_DIR)/package.mk
 include $(TOPDIR)/feeds/packages/lang/golang/golang-package.mk
