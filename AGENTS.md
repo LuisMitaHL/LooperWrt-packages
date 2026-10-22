@@ -20,11 +20,15 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   `snmpd-librenms` pins its upstream download in `PKG_SOURCE_VERSION`, never
   in `PKG_VERSION`; `dhcpoptinj` follows the same rule (HTTPS git pin at
   `https://github.com/LuisMitaHL/dhcpoptinj`).
-- `dhcpoptinj` and `ap-isolation` pin their sources from upstream git repos
-  (`dhcpoptinj` from `LuisMitaHL/dhcpoptinj`; `ap-isolation` from
-  `LuisMitaHL/openwrt-public-ap-isolation`, whose repo root is the package
-  root). This feed is the build recipe; bump `PKG_SOURCE_VERSION` in the feed
-  Makefile when those repos change. Both are selected on every `ap` profile via
+- `dhcpoptinj`, `ap-isolation`, `antilag` and `luci-app-antilag` pin their
+  sources from upstream git repos (`dhcpoptinj` from `LuisMitaHL/dhcpoptinj`;
+  `ap-isolation` from `LuisMitaHL/openwrt-public-ap-isolation`, whose repo root
+  is the package root; `antilag` and `luci-app-antilag` from the same dev
+  repo `LuisMitaHL/laotrared-openwrt-antilag`, with the LuCI app installing
+  `luci-app-antilag/www` + `po` from the checkout and keeping `menu.d`/`acl.d`
+  inline). This feed is the build recipe; bump `PKG_SOURCE_VERSION`
+  (+ `PKG_SOURCE_DATE`) in both pin Makefiles when the dev repo changes.
+  Both ap-isolation families are selected on every `ap` profile via
   `configs/ap.config` in the builder. The `ap-isolation` Makefile also defines
   the qca8k-only `ap-isolation-fdb` add-on (stale-ATU roaming workaround),
   selected only in `configs/target-ipq40xx.config` and disabled by default.
