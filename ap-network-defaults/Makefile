@@ -29,7 +29,10 @@ define Package/ap-network-defaults/description
   and RA servers are turned off when the server packages are installed (ap_lite
   ships none), and antilag is disabled when installed because no L3 uplink
   remains to shape. Apply-once, guarded by
-  the looperwrt.ap_netdefaults marker like the branch 99_*-defaults.
+  the looperwrt.ap_netdefaults marker like the branch 99_*-defaults, but the
+  conversion is destructive, so it only runs when the network config still
+  has the stock loopback/lan/wan shape; any operator-crafted config is left
+  untouched and marked applied='skipped'.
 endef
 
 define Build/Compile
