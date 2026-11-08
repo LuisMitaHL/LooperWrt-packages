@@ -494,9 +494,11 @@ apply() {
 	wan_ok && WAN=1
 	trm_ok && TRM_LEASE=1
 
+	USB_RADIO=""
 	if [ "$USB_PRESENT" = 1 ]; then
-		TRM_RADIO=$(find_usb_radio)
+		USB_RADIO=$(find_usb_radio)
 	fi
+	TRM_RADIO="$USB_RADIO"
 	if [ -z "$TRM_RADIO" ]; then
 		TRM_RADIO=$(find_builtin_5g)
 	fi
