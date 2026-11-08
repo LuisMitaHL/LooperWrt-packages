@@ -1,0 +1,20 @@
+#!/bin/sh
+# Case slider (gpio-button-hotplug maps the EV_SW "mode" key to BTN_0).
+# The initial state is reported at module load, so this also seeds the
+# state at boot before the init script runs.
+
+[ "$BUTTON" = "BTN_0" ] || exit 0
+case "$ACTION" in
+	pressed|released) ;;
+	*) exit 0 ;;
+esac
+
+mkdir -p /tmp/pasankalla
+if [ "$ACTION" = "pressed" ]; then
+	echo 1 > /tmp/pasankalla/slider
+else
+	echo 0 > /tmp/pasankalla/slider
+fi
+
+# Do not block the hotplug caller: applying a slider change may reload wifi.
+/usr/sbin/pasankalla apply >/dev/null 2>&1 &

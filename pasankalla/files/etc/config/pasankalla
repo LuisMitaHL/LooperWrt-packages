@@ -1,0 +1,47 @@
+# Pasankalla mobile-router defaults. Managed by /usr/sbin/pasankalla.
+config pasankalla 'settings'
+	# Master switch for the guest AP, travelmate and the status LEDs.
+	# When 0 the guest BSSes are disabled, travelmate is stopped and both
+	# LEDs are turned off.
+	option enabled '1'
+
+	# Guest AP. The SSID is used verbatim; new sections are created with
+	# encryption 'owe' (no transition/open twin). Existing AP sections on
+	# this SSID and on guest_network are adopted as-is, which keeps the
+	# original Pasankalla open+hidden-OWE transition pair working.
+	option guest_ssid 'Pasankalla gratis'
+	option guest_network 'lanclientes'
+
+	# When travelmate uses the same radio as a 5 GHz guest BSS, disable
+	# that BSS (the old Pasankalla scripts did this to avoid AP+STA
+	# scanning on the same weak radio). Set to 0 to keep it up.
+	option guest_5g_follow_uplink '1'
+
+	# Slider logical state: gpio-button-hotplug reports pressed/released
+	# for BTN_0 at boot and on every flip. Set to 1 if the slider is wired
+	# the other way round on a board revision.
+	option slider_invert '0'
+
+	# At boot, wait this many seconds for the ethernet WAN to obtain its
+	# DHCP lease before starting travelmate. Without it a fast boot would
+	# briefly start a 5 GHz scan on a router whose WAN is actually connected.
+	# 0 disables the wait.
+	option wan_grace '20'
+
+	# Seconds without a WAN or travelmate lease before the "no internet"
+	# state (white off, red slow blink) is shown. Travelmate keeps
+	# searching during and after this grace period.
+	option offline_after '60'
+
+	# Safety-net poll. Button/interface/wireless hotplug events apply the
+	# state immediately; this only catches missed events.
+	option poll_interval '30'
+
+	# sysfs LED names (both boards expose these labels from their DTS).
+	option led_white 'white:status'
+	option led_red 'red:power'
+
+	# Managed by zz-pasankalla: wifi-iface section names that belong to the
+	# guest AP. Empty means "discover by guest_ssid + guest_network".
+	# list guest_sections 'pasankalla2'
+	# list guest_sections 'pasankalla5'

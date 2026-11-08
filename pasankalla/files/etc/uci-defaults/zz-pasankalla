@@ -1,0 +1,377 @@
+#!/bin/sh
+# zz-pasankalla -- first-boot defaults for the Pasankalla feed package.
+#
+# Named zz-* so it runs AFTER the branch's 99_aurora-defaults on the TR3000:
+# that script rewrites every existing wifi-iface into a LOR_ private AP, so
+# creating the guest BSS earlier would get it clobbered. Idempotent: package
+# upgrades can re-run it, and it adopts an existing "Pasankalla gratis"
+# open+hidden-OWE transition pair instead of creating duplicate BSSes.
+#
+# It creates (only when missing):
+#   * lanclientes: a dedicated guest interface (br-lan.10 when a br-lan
+#     bridge exists, otherwise a local br-guest bridge), 100.102.13.37/16,
+#     in the lan firewall zone, with a DHCP server;
+#   * trm_wwan/trm_wwan6 in the wan firewall zone, for travelmate;
+#   * one OWE-only guest AP per built-in band, SSID "Pasankalla gratis",
+#     disabled until the slider is turned on;
+#   * the travelmate trm_iface/trm_radio baseline (travelmate stays disabled
+#     until the uplink watchdog needs it).
+#
+# No wifi reload here: this runs during boot before/around wifi start, and a
+# live package install leaves the new guest BSSes disabled until the slider
+# is flipped (which triggers an apply).
+
+CONFIG=pasankalla
+GUEST_NET=lanclientes
+TRM_IF=trm_wwan
+TRM6_IF=trm_wwan6
+VLAN_ID=10
+VLAN_DEV=br-lan.10
+
+notice() {
+	echo "pasankalla: $*" > /dev/kmsg 2>/dev/null
+}
+
+die() {
+	notice "$*"
+	exit 1
+}
+
+find_dev() {
+	uci -q show network 2>/dev/null |
+		sed -n "s/^network\.\([^.=]*\)\.name='$1'$/\1/p" | head -n1
+}
+
+zone_id() {
+	uci -q show firewall 2>/dev/null |
+		sed -n "s/^firewall\.\([^.=]*\)\.name='$1'$/\1/p" | head -n1
+}
+
+add_zone_network() {
+	local z="$1" n="$2"
+	[ -n "$z" ] || return 0
+	case " $(uci -q get "firewall.$z.network") " in
+	*" $n "*) return 0 ;;
+	esac
+	uci -q add_list "firewall.$z.network=$n"
+	FIREWALL_CHANGED=1
+}
+
+find_bridge_vlan() {
+	local s
+	for s in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=bridge-vlan$/\1/p'); do
+		[ "$(uci -q get "network.$s.device")" = "$1" ] || continue
+		[ "$(uci -q get "network.$s.vlan")" = "$VLAN_ID" ] && { echo "$s"; return 0; }
+	done
+	return 1
+}
+
+# Any bridge-vlan entry on the bridge means the bridge is VLAN-filtering, so
+# the guest VLAN must be a bridge-vlan too (an 8021q device on top of it would
+# not be tagged by the switch).
+find_any_bridge_vlan() {
+	local s
+	for s in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=bridge-vlan$/\1/p'); do
+		[ "$(uci -q get "network.$s.device")" = "$1" ] && { echo "$s"; return 0; }
+	done
+	return 1
+}
+
+# Tag the LAN port(s) for the guest VLAN, matching the original TR3000 setup
+# (eth1 becomes eth1:t). Without ports the VLAN exists only locally, which is
+# enough for the guest BSSes but not for a tagged wired guest port.
+bridge_vlan_ports() {
+	local dev="$1" s vlan1="" ports="" p
+	for s in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=bridge-vlan$/\1/p'); do
+		[ "$(uci -q get "network.$s.device")" = "$dev" ] || continue
+		[ "$(uci -q get "network.$s.vlan")" = 1 ] || continue
+		vlan1=$(uci -q get "network.$s.ports")
+		break
+	done
+	if [ -z "$vlan1" ]; then
+		s=$(find_dev "$dev")
+		[ -n "$s" ] && vlan1=$(uci -q get "network.$s.ports")
+	fi
+	for p in $vlan1; do
+		p=$(echo "$p" | cut -d: -f1)
+		[ -n "$p" ] && ports="$ports $p:t"
+	done
+	echo "$ports" | sed 's/^ //'
+}
+
+find_dhcp_iface() {
+	local s
+	for s in $(uci -q show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^.=]*\)=dhcp$/\1/p'); do
+		[ "$(uci -q get "dhcp.$s.interface")" = "$1" ] && { echo "$s"; return 0; }
+	done
+	return 1
+}
+
+radio_list() {
+	uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'
+}
+
+radio_band() {
+	local b ch hw
+	b=$(uci -q get "wireless.$1.band")
+	case "$b" in
+	2g|5g) echo "$b"; return 0 ;;
+	esac
+	ch=$(uci -q get "wireless.$1.channel")
+	case "$ch" in
+	''|auto) ;;
+	*[!0-9]*) ;;
+	*)
+		if [ "$ch" -le 14 ]; then echo 2g; else echo 5g; fi
+		return 0
+		;;
+	esac
+	hw=$(uci -q get "wireless.$1.hwmode")
+	case "$hw" in
+	*11a*) echo 5g; return 0 ;;
+	*11g*) echo 2g; return 0 ;;
+	esac
+	case "$1" in
+	*0) echo 2g ;;
+	*1) echo 5g ;;
+	esac
+}
+
+[ -f /etc/config/network ] || exit 1
+uci show network >/dev/null 2>&1 || die "network config is unparseable"
+[ -f /etc/config/wireless ] || exit 1
+uci show wireless >/dev/null 2>&1 || die "wireless config is unparseable"
+
+GUEST_SSID=$(uci -q get "$CONFIG.settings.guest_ssid")
+[ -n "$GUEST_SSID" ] || GUEST_SSID='Pasankalla gratis'
+GUEST_NET=$(uci -q get "$CONFIG.settings.guest_network")
+[ -n "$GUEST_NET" ] || GUEST_NET=lanclientes
+
+NETWORK_CHANGED=0
+FIREWALL_CHANGED=0
+DHCP_CHANGED=0
+WIRELESS_CHANGED=0
+TRAVELMATE_CHANGED=0
+PASANKALLA_CHANGED=0
+GUEST_NET_OK=0
+
+# --- guest network: dedicated guest device + lanclientes ------------------
+# The original TR3000 used br-lan.10. Keep that when a br-lan bridge exists
+# (DSA bridge-vlan or a plain 8021q on the bridge), but swconfig targets such
+# as the TR1200 have no br-lan device at all -- there the guest BSSes get
+# their own empty bridge, which also keeps guest traffic off the LAN ports.
+if uci -q get "network.$GUEST_NET" >/dev/null 2>&1; then
+	GUEST_NET_OK=1
+else
+	brdev=$(find_dev br-lan)
+	if [ -n "$brdev" ]; then
+		GUEST_NET_OK=1
+		# find_dev returns the section id; bridge-vlan entries refer to
+		# the bridge by its device name.
+		brdev_name=$(uci -q get "network.$brdev.name")
+		[ -n "$brdev_name" ] || brdev_name=br-lan
+		# A bridge-vlan entry already creates br-lan.<vid> (the live
+		# TR3000 setup uses this). Any bridge-vlan on the bridge means
+		# VLAN filtering is in use, so the guest VLAN must be a
+		# bridge-vlan too; only a plain bridge gets an 8021q device.
+		if find_bridge_vlan "$brdev_name" >/dev/null; then
+			:
+		elif [ -n "$(find_any_bridge_vlan "$brdev_name")" ] ||
+		     [ "$(uci -q get "network.$brdev.vlan_filtering")" = 1 ]; then
+			# DSA bridge with VLAN filtering: match the original
+			# Pasankalla config, including the tagged LAN port(s).
+			uci -q add network bridge-vlan
+			uci -q set "network.@bridge-vlan[-1].device=$brdev_name"
+			uci -q set "network.@bridge-vlan[-1].vlan=$VLAN_ID"
+			vlan_ports=$(bridge_vlan_ports "$brdev_name")
+			[ -n "$vlan_ports" ] && \
+				uci -q set "network.@bridge-vlan[-1].ports=$vlan_ports"
+			NETWORK_CHANGED=1
+		elif [ -z "$(find_dev "$VLAN_DEV")" ]; then
+			uci -q add network device
+			uci -q set "network.@device[-1].name=$VLAN_DEV"
+			uci -q set "network.@device[-1].type=8021q"
+			uci -q set "network.@device[-1].ifname=br-lan"
+			uci -q set "network.@device[-1].vid=$VLAN_ID"
+			NETWORK_CHANGED=1
+		fi
+		guest_dev="$VLAN_DEV"
+	else
+		# swconfig / no br-lan: an empty bridge is enough. hostapd adds the
+		# guest BSS netdevs to it when wifi starts.
+		GUEST_NET_OK=1
+		if [ -z "$(find_dev br-guest)" ]; then
+			uci -q set network.guestdev=device
+			uci -q set network.guestdev.name=br-guest
+			uci -q set network.guestdev.type=bridge
+			uci -q set network.guestdev.bridge_empty=1
+			NETWORK_CHANGED=1
+		fi
+		guest_dev=br-guest
+	fi
+	uci -q set "network.$GUEST_NET=interface"
+	uci -q set "network.$GUEST_NET.proto=static"
+	uci -q set "network.$GUEST_NET.device=$guest_dev"
+	uci -q set "network.$GUEST_NET.ipaddr=100.102.13.37"
+	uci -q set "network.$GUEST_NET.netmask=255.255.0.0"
+	NETWORK_CHANGED=1
+fi
+
+# --- travelmate uplink interface + firewall --------------------------------
+if ! uci -q get "network.$TRM_IF" >/dev/null 2>&1; then
+	uci -q set "network.$TRM_IF=interface"
+	uci -q set "network.$TRM_IF.proto=dhcp"
+	uci -q set "network.$TRM_IF.metric=100"
+	NETWORK_CHANGED=1
+fi
+if ! uci -q get "network.$TRM6_IF" >/dev/null 2>&1; then
+	uci -q set "network.$TRM6_IF=interface"
+	uci -q set "network.$TRM6_IF.proto=dhcpv6"
+	uci -q set "network.$TRM6_IF.device=@$TRM_IF"
+	uci -q set "network.$TRM6_IF.reqaddress=try"
+	uci -q set "network.$TRM6_IF.reqprefix=no"
+	NETWORK_CHANGED=1
+fi
+
+if [ -f /etc/config/firewall ]; then
+	wan_zone=$(zone_id wan)
+	[ -n "$wan_zone" ] || wan_zone=$(uci -q show firewall | sed -n 's/^firewall\.\([^.=]*\)\.masq=.1.$/\1/p' | head -n1)
+	add_zone_network "$wan_zone" "$TRM_IF"
+	add_zone_network "$wan_zone" "$TRM6_IF"
+	if [ "$GUEST_NET_OK" = 1 ]; then
+		lan_zone=$(zone_id lan)
+		add_zone_network "$lan_zone" "$GUEST_NET"
+	fi
+fi
+
+# --- guest DHCP ------------------------------------------------------------
+if [ "$GUEST_NET_OK" = 1 ] && [ -f /etc/config/dhcp ]; then
+	if ! find_dhcp_iface "$GUEST_NET" >/dev/null; then
+		uci -q set "dhcp.$GUEST_NET=dhcp"
+		uci -q set "dhcp.$GUEST_NET.interface=$GUEST_NET"
+		uci -q set "dhcp.$GUEST_NET.start=3585"
+		uci -q set "dhcp.$GUEST_NET.limit=60000"
+		uci -q set "dhcp.$GUEST_NET.leasetime=2m"
+		uci -q set "dhcp.$GUEST_NET.force=1"
+		DHCP_CHANGED=1
+	fi
+fi
+
+# --- guest APs: adopt the existing pair, otherwise create OWE-only ---------
+adopted=""
+have2g=0
+have5g=0
+for s in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+	case "$s" in
+	@*) continue ;;
+	esac
+	[ "$(uci -q get "wireless.$s.mode")" = ap ] || continue
+	ssid=$(uci -q get "wireless.$s.ssid")
+	case "$ssid" in
+	"$GUEST_SSID"|"$GUEST_SSID WPA3") ;;
+	*) continue ;;
+	esac
+	[ "$(uci -q get "wireless.$s.network")" = "$GUEST_NET" ] || continue
+	adopted="$adopted $s"
+	dev=$(uci -q get "wireless.$s.device")
+	band=$(radio_band "$dev")
+	[ "$band" = 2g ] && have2g=1
+	[ "$band" = 5g ] && have5g=1
+done
+
+create_guest() {
+	local n="$1" r="$2"
+	if uci -q get "wireless.$n" >/dev/null 2>&1; then
+		notice "wireless.$n exists but is not a Pasankalla guest; leaving it alone"
+		return 1
+	fi
+	uci -q set "wireless.$n=wifi-iface"
+	uci -q set "wireless.$n.device=$r"
+	uci -q set "wireless.$n.mode=ap"
+	uci -q set "wireless.$n.ssid=$GUEST_SSID"
+	uci -q set "wireless.$n.encryption=owe"
+	uci -q set "wireless.$n.network=$GUEST_NET"
+	uci -q set "wireless.$n.disabled=1"
+	uci -q set "wireless.$n.ieee80211k=1"
+	uci -q set "wireless.$n.wnm_sleep_mode=1"
+	uci -q set "wireless.$n.bss_transition=1"
+	uci -q set "wireless.$n.proxy_arp=1"
+	uci -q set "wireless.$n.dtim_period=3"
+	uci -q set "wireless.$n.max_inactivity=60"
+	adopted="$adopted $n"
+	WIRELESS_CHANGED=1
+	return 0
+}
+
+if [ "$GUEST_NET_OK" = 1 ]; then
+	for r in $(radio_list); do
+		case "$r" in
+		@*) continue ;;
+		esac
+		path=$(uci -q get "wireless.$r.path")
+		case "$path" in
+		*usb*) continue ;;
+		esac
+		band=$(radio_band "$r")
+		case "$band" in
+		2g)
+			[ "$have2g" = 1 ] || create_guest pasankalla2 "$r"
+			;;
+		5g)
+			[ "$have5g" = 1 ] || create_guest pasankalla5 "$r"
+			;;
+		esac
+	done
+
+	if [ -n "$adopted" ]; then
+		for s in $adopted; do
+			case " $(uci -q get "$CONFIG.settings.guest_sections") " in
+			*" $s "*) ;;
+			*)
+				uci -q add_list "$CONFIG.settings.guest_sections=$s"
+				PASANKALLA_CHANGED=1
+				;;
+			esac
+		done
+	fi
+fi
+
+# --- travelmate baseline ---------------------------------------------------
+if [ -f /etc/config/travelmate ]; then
+	if ! uci -q get travelmate.global >/dev/null 2>&1; then
+		uci -q set travelmate.global=travelmate
+		TRAVELMATE_CHANGED=1
+	fi
+	[ "$(uci -q get travelmate.global.trm_iface)" = "$TRM_IF" ] || {
+		uci -q set "travelmate.global.trm_iface=$TRM_IF"
+		TRAVELMATE_CHANGED=1
+	}
+	if [ -z "$(uci -q get travelmate.global.trm_radio)" ]; then
+		r=$(for x in $(radio_list); do
+			case "$(uci -q get "wireless.$x.path")" in *usb*) continue ;; esac
+			[ "$(radio_band "$x")" = 5g ] && { echo "$x"; break; }
+		done)
+		[ -n "$r" ] && { uci -q set "travelmate.global.trm_radio=$r"; TRAVELMATE_CHANGED=1; }
+	fi
+	for s in $(uci -q show wireless | sed -n 's/^wireless\.\(trm_uplink[0-9]*\)=wifi-iface$/\1/p'); do
+		[ "$(uci -q get "wireless.$s.network")" = "$TRM_IF" ] || {
+			uci -q set "wireless.$s.network=$TRM_IF"
+			WIRELESS_CHANGED=1
+		}
+	done
+	# Start disabled: pasankalla enables/starts travelmate only when WAN is
+	# down, so a WAN-connected boot never runs a scan on the 5 GHz radio.
+	/etc/init.d/travelmate disable >/dev/null 2>&1
+fi
+
+# --- commit ----------------------------------------------------------------
+[ "$NETWORK_CHANGED" = 1 ] && { uci -q commit network || die "cannot commit network"; }
+[ "$FIREWALL_CHANGED" = 1 ] && { uci -q commit firewall || die "cannot commit firewall"; }
+[ "$DHCP_CHANGED" = 1 ] && { uci -q commit dhcp || die "cannot commit dhcp"; }
+[ "$WIRELESS_CHANGED" = 1 ] && { uci -q commit wireless || die "cannot commit wireless"; }
+[ "$TRAVELMATE_CHANGED" = 1 ] && { uci -q commit travelmate || die "cannot commit travelmate"; }
+[ "$PASANKALLA_CHANGED" = 1 ] && { uci -q commit "$CONFIG" || die "cannot commit $CONFIG"; }
+
+[ -n "$adopted" ] || adopted=none
+notice "configured guest=$GUEST_NET ssid=$GUEST_SSID sections=$adopted"
+exit 0

@@ -1,0 +1,12 @@
+#!/bin/sh
+# A phy appeared or disappeared. /etc/hotplug.d/ieee80211/10-wifi-detect
+# runs first and calls /sbin/wifi config, so by the time this runs the USB
+# radio section exists (or is stale after unplug). Re-evaluate the uplink
+# radio and the guest APs.
+
+case "$ACTION" in
+	add|remove) ;;
+	*) exit 0 ;;
+esac
+
+/usr/sbin/pasankalla apply >/dev/null 2>&1 &

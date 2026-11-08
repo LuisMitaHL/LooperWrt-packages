@@ -1,0 +1,15 @@
+#!/bin/sh
+# WAN and travelmate uplink came up or went down. Netifd calls this after
+# the interface state (and DHCP address) is updated, so ifstatus is accurate
+# here -- unlike the udhcpc bound hook, which runs before netifd sees it.
+
+case "$ACTION" in
+	ifup|ifdown) ;;
+	*) exit 0 ;;
+esac
+case "$INTERFACE" in
+	wan|wan6|trm_wwan|trm_wwan6) ;;
+	*) exit 0 ;;
+esac
+
+/usr/sbin/pasankalla apply >/dev/null 2>&1 &

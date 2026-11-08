@@ -1,0 +1,709 @@
+#!/bin/sh
+# Pasankalla uplink/LED state machine and guest-AP manager.
+#
+# States (white:status / red:power):
+#   wan     WAN has an address              white solid     red off
+#   wifi    travelmate on built-in 5 GHz    white 1s blink  red off
+#   usb     travelmate on a USB WiFi radio  white 0.25s     red off
+#   offline no internet after the grace     white off       red 1s blink
+#   disabled master switch off              both off
+#
+# The guest AP follows the slider (BTN_0): on = enabled. The 5 GHz guest BSS
+# is additionally disabled while travelmate uses that same radio. Travelmate
+# uplinks are moved between the built-in 5 GHz radio and a hot-plugged USB
+# radio; wan always wins and stops travelmate.
+#
+# Event sources: /etc/hotplug.d/button, /etc/hotplug.d/iface,
+# /etc/hotplug.d/ieee80211, plus a 30 s poll from the procd daemon. All
+# applies are serialized with flock. LED blinking is done by the kernel LED
+# timer trigger, not by this script.
+
+CONFIG=pasankalla
+STATE_DIR=/tmp/pasankalla
+SLIDER_FILE="$STATE_DIR/slider"
+OFFLINE_FILE="$STATE_DIR/offline_since"
+SIG_FILE="$STATE_DIR/sig"
+LOCK_FILE="$STATE_DIR/lock"
+WAN_IF=wan
+WAN6_IF=wan6
+TRM_IF=trm_wwan
+TRM6_IF=trm_wwan6
+TRM_IFACE=trm_wwan
+
+log() {
+	logger -t pasankalla "$*" 2>/dev/null
+}
+
+is_num() {
+	case "$1" in
+	''|*[!0-9]*) return 1 ;;
+	*) return 0 ;;
+	esac
+}
+
+cfg() {
+	local v
+	v=$(uci -q get "$CONFIG.settings.$1")
+	if [ -n "$v" ]; then
+		echo "$v"
+	else
+		echo "$2"
+	fi
+}
+
+load_cfg() {
+	ENABLED=$(cfg enabled 1)
+	GUEST_SSID=$(cfg guest_ssid 'Pasankalla gratis')
+	GUEST_NET=$(cfg guest_network 'lanclientes')
+	GUEST_5G_FOLLOW=$(cfg guest_5g_follow_uplink 1)
+	SLIDER_INVERT=$(cfg slider_invert 0)
+	WAN_GRACE=$(cfg wan_grace 20)
+	OFFLINE_AFTER=$(cfg offline_after 60)
+	POLL_INTERVAL=$(cfg poll_interval 30)
+	LED_WHITE=$(cfg led_white 'white:status')
+	LED_RED=$(cfg led_red 'red:power')
+
+	is_num "$WAN_GRACE" || WAN_GRACE=20
+	is_num "$OFFLINE_AFTER" || OFFLINE_AFTER=60
+	is_num "$POLL_INTERVAL" || POLL_INTERVAL=30
+	[ "$OFFLINE_AFTER" -ge 0 ] 2>/dev/null || OFFLINE_AFTER=60
+	[ "$POLL_INTERVAL" -ge 5 ] 2>/dev/null || POLL_INTERVAL=30
+}
+
+iface_v4() {
+	local addr
+	addr=$(ifstatus "$1" 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+	case "$addr" in
+	''|null|0.0.0.0|169.254.*) return 1 ;;
+	esac
+	return 0
+}
+
+iface_v6() {
+	local addr
+	for addr in $(ifstatus "$1" 2>/dev/null | jsonfilter -e '@["ipv6-address"][*].address' 2>/dev/null); do
+		case "$addr" in
+		null|fe80:*|'') continue ;;
+		esac
+		return 0
+	done
+	return 1
+}
+
+wan_ok() {
+	iface_v4 "$WAN_IF" || iface_v6 "$WAN6_IF"
+}
+
+trm_ok() {
+	iface_v4 "$TRM_IF" || iface_v6 "$TRM6_IF"
+}
+
+radio_list() {
+	uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'
+}
+
+usb_phy_paths() {
+	local p t
+	for p in /sys/class/ieee80211/phy*; do
+		[ -e "$p" ] || continue
+		t=$(readlink -f "$p/device" 2>/dev/null) || continue
+		case "$t" in
+		*usb*) echo "${t#/sys/devices/}" ;;
+		esac
+	done
+}
+
+find_usb_radio() {
+	local r rp up
+	for r in $(radio_list); do
+		rp=$(uci -q get "wireless.$r.path")
+		case "$rp" in
+		*usb*) ;;
+		*) continue ;;
+		esac
+		for up in $USB_PATHS; do
+			case "$rp" in
+			"$up"|"$up"+*) echo "$r"; return 0 ;;
+			esac
+		done
+	done
+	# Fallback: a USB radio section exists but its path did not match the
+	# current phy (e.g. an older section for another USB port). Prefer the
+	# first one; wifi-detect will have added a matching one above when it
+	# could.
+	for r in $(radio_list); do
+		rp=$(uci -q get "wireless.$r.path")
+		case "$rp" in
+		*usb*) echo "$r"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+radio_band() {
+	local b ch hw
+	b=$(uci -q get "wireless.$1.band")
+	case "$b" in
+	2g|5g) echo "$b"; return 0 ;;
+	esac
+	ch=$(uci -q get "wireless.$1.channel")
+	case "$ch" in
+	''|auto) ;;
+	*[!0-9]*) ;;
+	*)
+		if [ "$ch" -le 14 ]; then echo 2g; else echo 5g; fi
+		return 0
+		;;
+	esac
+	hw=$(uci -q get "wireless.$1.hwmode")
+	case "$hw" in
+	*11a*) echo 5g; return 0 ;;
+	*11g*) echo 2g; return 0 ;;
+	esac
+	case "$1" in
+	*0) echo 2g ;;
+	*1) echo 5g ;;
+	esac
+}
+
+find_builtin_5g() {
+	local r rp
+	for r in $(radio_list); do
+		rp=$(uci -q get "wireless.$r.path")
+		case "$rp" in
+		*usb*) continue ;;
+		esac
+		[ "$(radio_band "$r")" = 5g ] && { echo "$r"; return 0; }
+	done
+	return 1
+}
+
+set_radio_disabled() {
+	[ -n "$1" ] || return 0
+	[ "$(uci -q get "wireless.$1.disabled")" = "$2" ] && return 0
+	uci -q set "wireless.$1.disabled=$2"
+	WIRELESS_CHANGED=1
+}
+
+set_trm_enabled() {
+	[ -f /etc/config/travelmate ] || return 0
+	if ! uci -q get travelmate.global >/dev/null 2>&1; then
+		uci -q set travelmate.global=travelmate
+		TRAVELMATE_CHANGED=1
+	fi
+	[ "$(uci -q get travelmate.global.trm_enabled)" = "$1" ] && return 0
+	uci -q set "travelmate.global.trm_enabled=$1"
+	TRAVELMATE_CHANGED=1
+}
+
+set_trm_radio() {
+	local r="$1" s
+	[ -n "$r" ] || return 0
+	[ -f /etc/config/travelmate ] || return 0
+
+	if ! uci -q get travelmate.global >/dev/null 2>&1; then
+		uci -q set travelmate.global=travelmate
+		TRAVELMATE_CHANGED=1
+	fi
+	[ "$(uci -q get travelmate.global.trm_iface)" = "$TRM_IFACE" ] || {
+		uci -q set "travelmate.global.trm_iface=$TRM_IFACE"
+		TRAVELMATE_CHANGED=1
+	}
+	[ "$(uci -q get travelmate.global.trm_radio)" = "$r" ] || {
+		uci -q set "travelmate.global.trm_radio=$r"
+		TRAVELMATE_CHANGED=1
+	}
+
+	for s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\(trm_uplink[0-9]*\)=wifi-iface$/\1/p'); do
+		[ "$(uci -q get "wireless.$s.device")" = "$r" ] || {
+			uci -q set "wireless.$s.device=$r"
+			WIRELESS_CHANGED=1
+		}
+		[ "$(uci -q get "wireless.$s.network")" = "$TRM_IFACE" ] || {
+			uci -q set "wireless.$s.network=$TRM_IFACE"
+			WIRELESS_CHANGED=1
+		}
+	done
+
+	for s in $(uci -q show travelmate 2>/dev/null | sed -n 's/^travelmate\.\([^.=]*\)=uplink$/\1/p'); do
+		[ "$(uci -q get "travelmate.$s.device")" = "$r" ] || {
+			uci -q set "travelmate.$s.device=$r"
+			TRAVELMATE_CHANGED=1
+		}
+	done
+}
+
+guest_sections() {
+	local list s ssid net
+	list=$(uci -q get "$CONFIG.settings.guest_sections")
+	if [ -n "$list" ]; then
+		echo "$list"
+		return 0
+	fi
+	for s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		case "$s" in
+		@*) continue ;;
+		esac
+		[ "$(uci -q get "wireless.$s.mode")" = ap ] || continue
+		ssid=$(uci -q get "wireless.$s.ssid")
+		net=$(uci -q get "wireless.$s.network")
+		case "$ssid" in
+		"$GUEST_SSID"|"$GUEST_SSID WPA3") ;;
+		*) continue ;;
+		esac
+		[ "$net" = "$GUEST_NET" ] || continue
+		echo "$s"
+	done
+}
+
+# Private APs on the radio travelmate is using must be down while it scans
+# (the original scripts disabled wifilan5 on the built-in 5 GHz radio). The
+# original "disabled" value is stored on the same wifi-iface section, so the
+# suspend/resume transition is one atomic wireless commit and survives a
+# reboot with travelmate still active.
+suspend_aps() {
+	local r="$1" s cur
+	[ -n "$r" ] || return 0
+	for s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		case "$s" in
+		@*) continue ;;
+		esac
+		[ "$(uci -q get "wireless.$s.mode")" = ap ] || continue
+		[ "$(uci -q get "wireless.$s.device")" = "$r" ] || continue
+		case " $GUEST_LIST " in
+		*" $s "*) continue ;;
+		esac
+		cur=$(uci -q get "wireless.$s.disabled")
+		[ "$cur" = 1 ] && continue
+		[ -n "$cur" ] || cur=0
+		uci -q set "wireless.$s.pasankalla_suspended=1"
+		uci -q set "wireless.$s.pasankalla_orig_disabled=$cur"
+		uci -q set "wireless.$s.disabled=1"
+		WIRELESS_CHANGED=1
+	done
+}
+
+resume_aps() {
+	local keep="$1" s dev orig
+	for s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		case "$s" in
+		@*) continue ;;
+		esac
+		[ "$(uci -q get "wireless.$s.pasankalla_suspended")" = 1 ] || continue
+		dev=$(uci -q get "wireless.$s.device")
+		[ -n "$keep" ] && [ "$dev" = "$keep" ] && continue
+		orig=$(uci -q get "wireless.$s.pasankalla_orig_disabled")
+		case "$orig" in
+		0|1) ;;
+		*) orig=0 ;;
+		esac
+		[ "$(uci -q get "wireless.$s.disabled")" = "$orig" ] || {
+			uci -q set "wireless.$s.disabled=$orig"
+			WIRELESS_CHANGED=1
+		}
+		uci -q delete "wireless.$s.pasankalla_suspended"
+		uci -q delete "wireless.$s.pasankalla_orig_disabled"
+		WIRELESS_CHANGED=1
+	done
+}
+
+slider_on() {
+	local v
+	v=$(cat "$SLIDER_FILE" 2>/dev/null)
+	if [ -z "$v" ]; then
+		v=$(debugfs_slider)
+	fi
+	case "$v" in
+	1)
+		[ "$SLIDER_INVERT" = 1 ] && return 1
+		return 0
+		;;
+	0)
+		[ "$SLIDER_INVERT" = 1 ] && return 0
+		return 1
+		;;
+	esac
+	return 1
+}
+
+debugfs_slider() {
+	local line
+	line=$(grep -m1 'mode' /sys/kernel/debug/gpio 2>/dev/null)
+	case "$line" in
+	*"in  lo"*|*"in lo"*) echo 1 ;;
+	*"in  hi"*|*"in hi"*) echo 0 ;;
+	*) echo 0 ;;
+	esac
+}
+
+# True while the system is still inside the post-boot WAN grace window.
+# /proc/uptime is cheap; reading it costs less than starting a daemon.
+boot_grace() {
+	local up _
+	[ "$WAN_GRACE" -gt 0 ] 2>/dev/null || return 1
+	read -r up _ < /proc/uptime 2>/dev/null || return 1
+	up=${up%%.*}
+	is_num "$up" || return 1
+	[ "$up" -lt "$WAN_GRACE" ]
+}
+
+offline_expired() {
+	local now since
+	now=$(date +%s)
+	since=$(cat "$OFFLINE_FILE" 2>/dev/null)
+	if ! is_num "$since"; then
+		echo "$now" > "$OFFLINE_FILE"
+		return 1
+	fi
+	[ $((now - since)) -ge "$OFFLINE_AFTER" ]
+}
+
+tm_running() {
+	[ -x /etc/init.d/travelmate ] && /etc/init.d/travelmate running >/dev/null 2>&1
+}
+
+tm_stop() {
+	tm_running && /etc/init.d/travelmate stop >/dev/null 2>&1
+	# Keep travelmate out of the boot sequence while WAN owns the uplink;
+	# tm_start re-enables it when the router actually needs a wwan uplink.
+	/etc/init.d/travelmate enabled >/dev/null 2>&1 &&
+		/etc/init.d/travelmate disable >/dev/null 2>&1
+	return 0
+}
+
+tm_start() {
+	[ -x /etc/init.d/travelmate ] || return 0
+	/etc/init.d/travelmate enabled >/dev/null 2>&1 || /etc/init.d/travelmate enable >/dev/null 2>&1
+	/etc/init.d/travelmate start >/dev/null 2>&1
+	return 0
+}
+
+wifi_reload() {
+	/sbin/wifi reload >/dev/null 2>&1
+}
+
+led_set() {
+	local base="/sys/class/leds/$1" cur
+	[ -d "$base" ] || return 0
+	cur=$(cat "$base/trigger" 2>/dev/null)
+	case "$2" in
+	on)
+		case "$cur" in
+		*"[none]"*) ;;
+		*) echo none > "$base/trigger" 2>/dev/null ;;
+		esac
+		[ "$(cat "$base/brightness" 2>/dev/null)" = 1 ] || \
+			echo 1 > "$base/brightness" 2>/dev/null
+		;;
+	off)
+		case "$cur" in
+		*"[none]"*) ;;
+		*) echo none > "$base/trigger" 2>/dev/null ;;
+		esac
+		[ "$(cat "$base/brightness" 2>/dev/null)" = 0 ] || \
+			echo 0 > "$base/brightness" 2>/dev/null
+		;;
+	timer)
+		case "$cur" in
+		*"[timer]"*) ;;
+		*) echo timer > "$base/trigger" 2>/dev/null ;;
+		esac
+		[ "$(cat "$base/delay_on" 2>/dev/null)" = "$3" ] || \
+			echo "$3" > "$base/delay_on" 2>/dev/null
+		[ "$(cat "$base/delay_off" 2>/dev/null)" = "$3" ] || \
+			echo "$3" > "$base/delay_off" 2>/dev/null
+		;;
+	esac
+}
+
+apply_leds() {
+	case "$1" in
+	wan)
+		led_set "$LED_WHITE" on
+		led_set "$LED_RED" off
+		;;
+	wifi)
+		led_set "$LED_WHITE" timer 1000
+		led_set "$LED_RED" off
+		;;
+	usb)
+		led_set "$LED_WHITE" timer 250
+		led_set "$LED_RED" off
+		;;
+	offline)
+		led_set "$LED_WHITE" off
+		led_set "$LED_RED" timer 1000
+		;;
+	*)
+		led_set "$LED_WHITE" off
+		led_set "$LED_RED" off
+		;;
+	esac
+}
+
+state_log() {
+	local state="$1" sig
+	sig="$state|$WAN|$USB_ACTIVE|$TRM_LEASE|$SLIDER|$TRM_RADIO"
+	if [ "$(cat "$SIG_FILE" 2>/dev/null)" = "$sig" ]; then
+		return 0
+	fi
+	log "state=$state wan=$WAN usb=$USB_ACTIVE trm_lease=$TRM_LEASE slider=$SLIDER radio=${TRM_RADIO:-none}"
+	echo "$sig" > "$SIG_FILE" 2>/dev/null
+}
+
+apply() {
+	load_cfg
+	mkdir -p "$STATE_DIR" 2>/dev/null
+
+	WIRELESS_CHANGED=0
+	TRAVELMATE_CHANGED=0
+	WAN=0
+	USB_ACTIVE=0
+	TRM_LEASE=0
+	SLIDER=0
+	TRM_RADIO=""
+	GUEST_LIST=""
+
+	if [ "$ENABLED" != 1 ]; then
+		tm_stop
+		set_trm_enabled 0
+		GUEST_LIST=$(guest_sections)
+		for s in $GUEST_LIST; do
+			[ "$(uci -q get "wireless.$s")" = wifi-iface ] || continue
+			[ "$(uci -q get "wireless.$s.disabled")" = 1 ] || {
+				uci -q set "wireless.$s.disabled=1"
+				WIRELESS_CHANGED=1
+			}
+		done
+		resume_aps ""
+		if [ "$WIRELESS_CHANGED" = 1 ]; then
+			uci -q commit wireless && wifi_reload
+		fi
+		if [ "$TRAVELMATE_CHANGED" = 1 ]; then
+			uci -q commit travelmate
+		fi
+		apply_leds disabled
+		rm -f "$OFFLINE_FILE"
+		state_log disabled
+		return 0
+	fi
+
+	USB_PATHS=$(usb_phy_paths)
+	USB_PRESENT=0
+	[ -n "$USB_PATHS" ] && USB_PRESENT=1
+	wan_ok && WAN=1
+	trm_ok && TRM_LEASE=1
+
+	if [ "$USB_PRESENT" = 1 ]; then
+		TRM_RADIO=$(find_usb_radio)
+	fi
+	if [ -z "$TRM_RADIO" ]; then
+		TRM_RADIO=$(find_builtin_5g)
+	fi
+
+	# While the router just booted, give the ethernet WAN a chance to lease
+	# before starting a 5 GHz scan. A hotplug iface event re-applies as soon
+	# as the lease arrives, so this only delays the travelmate fallback.
+	WAN_WAIT=0
+	if [ "$WAN" = 0 ] && [ -n "$TRM_RADIO" ] && boot_grace; then
+		WAN_WAIT=1
+	fi
+	WANT_TRM=0
+	if [ "$WAN" = 0 ] && [ -n "$TRM_RADIO" ] && [ "$WAN_WAIT" = 0 ]; then
+		WANT_TRM=1
+	fi
+	[ "$WANT_TRM" = 1 ] && [ -n "$USB_RADIO" ] && USB_ACTIVE=1
+	slider_on && SLIDER=1
+	GUEST_LIST=$(guest_sections)
+
+	OLD_TRM_RADIO=$(uci -q get travelmate.global.trm_radio)
+	RADIO_CHANGED=0
+	[ "$OLD_TRM_RADIO" != "$TRM_RADIO" ] && RADIO_CHANGED=1
+	# A radio switch (USB plugged/unplugged) gets a fresh grace period, so
+	# the LED shows the new fast/slow blink before falling back to red.
+	if [ "$WANT_TRM" = 1 ] && [ "$RADIO_CHANGED" = 1 ]; then
+		rm -f "$OFFLINE_FILE"
+	fi
+
+	# WAN wins: stop travelmate before touching wifi so a reload cannot
+	# bring an uplink STA back up. On a radio change, also stop before the
+	# reload and start again afterwards.
+	if [ "$WANT_TRM" = 0 ]; then
+		tm_stop
+		set_trm_enabled 0
+	elif [ "$RADIO_CHANGED" = 1 ]; then
+		tm_stop
+	fi
+	if [ "$WANT_TRM" = 1 ]; then
+		set_trm_enabled 1
+	fi
+
+	# Only bring the selected travelmate radio up while travelmate is
+	# actually needed. With WAN up the radio is left alone (the guest loop
+	# below still enables whatever radio an active guest BSS needs), so a
+	# USB stick plugged into a WAN-connected router does not cost a reload.
+	if [ "$WANT_TRM" = 1 ] && [ -n "$TRM_RADIO" ]; then
+		set_radio_disabled "$TRM_RADIO" 0
+		set_trm_radio "$TRM_RADIO"
+	fi
+	# A stale USB radio section (unplugged, or another USB port) must not be
+	# brought up by wifi reload.
+	for r in $(radio_list); do
+		rp=$(uci -q get "wireless.$r.path")
+		case "$rp" in
+		*usb*) ;;
+		*) continue ;;
+		esac
+		[ "$WANT_TRM" = 1 ] && [ "$r" = "$TRM_RADIO" ] && continue
+		set_radio_disabled "$r" 1
+	done
+
+	# Keep the private APs off the radio travelmate is scanning on. Guest
+	# BSSes are handled by the follow-uplink rule below, so they are not
+	# touched here.
+	if [ "$WANT_TRM" = 1 ] && [ -n "$TRM_RADIO" ]; then
+		resume_aps "$TRM_RADIO"
+		suspend_aps "$TRM_RADIO"
+	else
+		resume_aps ""
+	fi
+
+	for s in $GUEST_LIST; do
+		[ "$(uci -q get "wireless.$s")" = wifi-iface ] || continue
+		desired=1
+		[ "$SLIDER" = 1 ] && desired=0
+		if [ "$desired" = 0 ] && [ "$GUEST_5G_FOLLOW" = 1 ] &&
+		   [ "$WANT_TRM" = 1 ] && [ -n "$TRM_RADIO" ]; then
+			dev=$(uci -q get "wireless.$s.device")
+			if [ "$dev" = "$TRM_RADIO" ] && [ "$(radio_band "$dev")" = 5g ]; then
+				desired=1
+			fi
+		fi
+		dev=$(uci -q get "wireless.$s.device")
+		if [ "$desired" = 0 ] && [ -n "$dev" ]; then
+			set_radio_disabled "$dev" 0
+		fi
+		[ "$(uci -q get "wireless.$s.disabled")" = "$desired" ] && continue
+		uci -q set "wireless.$s.disabled=$desired"
+		WIRELESS_CHANGED=1
+	done
+
+	if [ "$WIRELESS_CHANGED" = 1 ]; then
+		if uci -q commit wireless; then
+			wifi_reload
+		else
+			log "failed to commit wireless"
+			return 1
+		fi
+	fi
+	if [ "$TRAVELMATE_CHANGED" = 1 ]; then
+		uci -q commit travelmate || log "failed to commit travelmate"
+	fi
+
+	if [ "$WANT_TRM" = 1 ]; then
+		if ! tm_running; then
+			tm_start
+		elif [ "$RADIO_CHANGED" = 1 ]; then
+			tm_start
+		fi
+	fi
+
+	if [ "$WAN" = 1 ]; then
+		state=wan
+		rm -f "$OFFLINE_FILE"
+	elif [ "$WAN_WAIT" = 1 ]; then
+		# WAN may still lease; show the travelmate "searching" blink rather
+		# than claiming the router is offline.
+		state=wifi
+	elif [ "$WANT_TRM" = 0 ]; then
+		state=offline
+		rm -f "$OFFLINE_FILE"
+	elif [ "$TRM_LEASE" = 1 ]; then
+		state=wifi
+		[ "$USB_ACTIVE" = 1 ] && state=usb
+		rm -f "$OFFLINE_FILE"
+	else
+		if offline_expired; then
+			state=offline
+		else
+			state=wifi
+			[ "$USB_ACTIVE" = 1 ] && state=usb
+		fi
+	fi
+
+	apply_leds "$state"
+	state_log "$state"
+	return 0
+}
+
+apply_locked() {
+	(
+		# busybox flock has no -w timeout; a blocking lock is what we want
+		# here because the critical section is short (uci + wifi reload).
+		flock -x 9 || {
+			log "apply lock failed"
+			exit 0
+		}
+		apply
+	) 9>"$LOCK_FILE"
+}
+
+daemon() {
+	load_cfg
+	while :; do
+		apply_locked
+		sleep "$POLL_INTERVAL"
+	done
+}
+
+status() {
+	load_cfg
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	USB_PATHS=$(usb_phy_paths)
+	USB_PRESENT=0
+	[ -n "$USB_PATHS" ] && USB_PRESENT=1
+	WAN=0
+	wan_ok && WAN=1
+	TRM_LEASE=0
+	trm_ok && TRM_LEASE=1
+	USB_RADIO=""
+	if [ "$USB_PRESENT" = 1 ]; then
+		USB_RADIO=$(find_usb_radio)
+	fi
+	TRM_RADIO="$USB_RADIO"
+	[ -n "$TRM_RADIO" ] || TRM_RADIO=$(find_builtin_5g)
+	WAN_WAIT=0
+	if [ "$WAN" = 0 ] && [ -n "$TRM_RADIO" ] && boot_grace; then
+		WAN_WAIT=1
+	fi
+	SLIDER=0
+	slider_on && SLIDER=1
+	echo "enabled=$ENABLED"
+	echo "slider=$SLIDER"
+	echo "wan=$WAN"
+	echo "wan_wait=$WAN_WAIT"
+	echo "usb_present=$USB_PRESENT"
+	echo "usb_active=$([ "$WAN" = 0 ] && [ "$WAN_WAIT" = 0 ] && [ -n "$USB_RADIO" ] && [ "$USB_RADIO" = "$TRM_RADIO" ] && echo 1 || echo 0)"
+	echo "trm_lease=$TRM_LEASE"
+	echo "trm_radio=${TRM_RADIO:-none}"
+	echo "travelmate_running=$(tm_running && echo 1 || echo 0)"
+	echo "guest_sections=$(guest_sections | tr '\n' ' ')"
+	echo "state=$(cat "$SIG_FILE" 2>/dev/null | cut -d'|' -f1)"
+}
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+case "$1" in
+apply)
+	apply_locked
+	;;
+daemon)
+	daemon
+	;;
+status)
+	status
+	;;
+*)
+	echo "usage: $0 {apply|daemon|status}" >&2
+	exit 1
+	;;
+esac
