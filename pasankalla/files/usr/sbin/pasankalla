@@ -28,6 +28,9 @@ STATE_DIR=/tmp/pasankalla
 SLIDER_FILE="$STATE_DIR/slider"
 OFFLINE_FILE="$STATE_DIR/offline_since"
 WAN_LINK_FILE="$STATE_DIR/wan_link_down"
+# Set while the WAN interface was torn down because its port died; the next
+# apply brings it back when the port links again.
+WAN_TORN_FILE="$STATE_DIR/wan_torn"
 WAN_PROBE_FILE="$STATE_DIR/wan_probe"
 SIG_FILE="$STATE_DIR/sig"
 DETECT_FILE="$STATE_DIR/detect"
@@ -352,6 +355,14 @@ wan_link_probe() {
 	return 1
 }
 
+# Netdev that carries the WAN (the configured device, else the l3 device).
+wan_dev() {
+	local dev
+	dev=$(uci -q get "network.$WAN_IF.device")
+	case "$dev" in ''|@*) dev=$(iface_l3dev "$WAN_IF") ;; esac
+	echo "$dev"
+}
+
 # True when the port under the WAN lost its link and stayed down for
 # wan_down_after seconds (debounces cable and port renegotiation). A WAN
 # that is leased but has no link is useless anyway, so the lease alone is
@@ -359,8 +370,7 @@ wan_link_probe() {
 wan_link_down() {
 	local dev now since
 	[ "$WAN_DOWN_AFTER" -gt 0 ] 2>/dev/null || return 1
-	dev=$(uci -q get "network.$WAN_IF.device")
-	case "$dev" in ''|@*) dev=$(iface_l3dev "$WAN_IF") ;; esac
+	dev=$(wan_dev)
 	if wan_link_probe "$dev"; then
 		# Only prune inside an existing state dir: rm -f on a missing
 		# path returns non-zero, and a failing command here would be
@@ -405,22 +415,30 @@ wan_link_down() {
 # a swconfig unplug netifd keeps the stale lease and up=true for minutes.
 wan_ok() {
 	local up
-	# Cheap path first: a healthy interface costs one ifstatus and skips
-	# the swconfig probe entirely (that one is ~0.4 s on a 580 MHz CPU).
-	up=$(ifstatus "$WAN_IF" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
-	if [ "$up" != false ]; then
-		if iface_v4 "$WAN_IF" || iface_v6 "$WAN6_IF"; then
-			if [ -d "$STATE_DIR" ]; then
-				rm -f "$WAN_LINK_FILE" "$WAN_LINK_FILE.done" \
-					"$WAN_LINK_FILE.lease" 2>/dev/null
-			fi
-			return 0
-		fi
-	fi
-	# Down, or up without a lease: only now is the physical link worth
-	# probing, and it is what starts/advances the debounce.
+	# The physical link comes first, always. A pulled swconfig cable keeps
+	# the stale lease and up=true for minutes, and any early "leased, so we
+	# are up" return here also erased the debounce timer that is the only
+	# thing noticing it - which is why an unplugged WAN stayed "up" and
+	# logged "wan link down detected" on every poll. The probe caches its
+	# verdict, so a healthy link costs a timestamp read.
 	if wan_link_down; then
 		return 1
+	fi
+	up=$(ifstatus "$WAN_IF" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
+	if [ "$up" = false ]; then
+		return 1
+	fi
+	if iface_v4 "$WAN_IF" || iface_v6 "$WAN6_IF"; then
+		return 0
+	fi
+	return 1
+}
+
+wan_iface_up() {
+	local up
+	up=$(ifstatus "$WAN_IF" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
+	if [ "$up" = true ]; then
+		return 0
 	fi
 	return 1
 }
@@ -1173,6 +1191,16 @@ apply() {
 	if [ -n "$USB_PATHS" ]; then
 		USB_PRESENT=1
 	fi
+	# The port that was torn down for a dead link is alive again: bring the
+	# interface back before the uplink is evaluated, so the wired WAN wins
+	# over travelmate again as soon as the cable is in.
+	if [ -f "$WAN_TORN_FILE" ] && ! wan_iface_up; then
+		if wan_link_up "$(wan_dev)"; then
+			log "wan link back: bringing the wan interface up"
+			/sbin/ifup "$WAN_IF" >/dev/null 2>&1
+			rm -f "$WAN_TORN_FILE"
+		fi
+	fi
 	wan_ok && WAN=1
 	trm_ok && TRM_LEASE=1
 	if [ "$TRM_LEASE" = 1 ]; then
@@ -1194,6 +1222,14 @@ apply() {
 	if wan_link_down; then
 		WAN_LINK_DOWN=1
 		WAN=0
+		# netifd still holds the address and the default route of the dead
+		# port, and that route (metric 0) keeps outbidding travelmate. Release
+		# them; the next apply brings the interface back once the port links.
+		if wan_iface_up; then
+			log "wan port down: releasing the stale lease"
+			echo 1 > "$WAN_TORN_FILE" 2>/dev/null
+			/sbin/ifdown "$WAN_IF" >/dev/null 2>&1
+		fi
 	fi
 
 	# While the router just booted, give the ethernet WAN a chance to lease
