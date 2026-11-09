@@ -1,0 +1,13 @@
+#!/bin/sh
+# Enable the modem-stats service by default on first boot.
+[ -e /etc/config/modem-stats ] || exit 0
+
+uci -q get modem-stats.config.enabled >/dev/null || {
+	uci set modem-stats.config.enabled='1'
+	uci commit modem-stats
+}
+
+# Enable the procd instance (init script checks the UCI flag itself).
+/etc/init.d/modem-stats enabled || /etc/init.d/modem-stats enable
+
+exit 0

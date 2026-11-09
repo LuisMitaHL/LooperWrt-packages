@@ -1,0 +1,5 @@
+config modem-stats 'config'
+	option host '192.168.8.1'
+	option password 'lolololol'
+	option interval '30'
+	option enabled '1'
