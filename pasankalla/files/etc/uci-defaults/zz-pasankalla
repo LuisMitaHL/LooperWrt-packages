@@ -15,8 +15,8 @@
 #   * trm_wwan/trm_wwan6 in the wan firewall zone, for travelmate;
 #   * one OWE-only guest AP per built-in band, SSID "Pasankalla gratis",
 #     disabled until the slider is turned on;
-#   * the travelmate trm_iface/trm_radio baseline (travelmate stays disabled
-#     until the uplink watchdog needs it).
+#   * the travelmate trm_iface/trm_radio baseline; travelmate is enabled by
+#     default and only stopped while the ethernet WAN carries the uplink.
 #
 # No wifi reload here: this runs during boot before/around wifi start, and a
 # live package install leaves the new guest BSSes disabled until the slider
@@ -174,6 +174,9 @@ if [ "$(uci -q get "network.$GUEST_NET.device")" != "$guest_dev" ]; then
 fi
 
 # --- travelmate uplink interface + firewall --------------------------------
+# trm_wwan is probed for its default route by route/lookup, so pasankalla
+# unplugs the travelmate STA from this network while the WAN owns the uplink
+# (see tm_setif in /usr/sbin/pasankalla); the interface stays configured.
 if ! uci -q get "network.$TRM_IF" >/dev/null 2>&1; then
 	uci -q set "network.$TRM_IF=interface"
 	uci -q set "network.$TRM_IF.proto=dhcp"
@@ -315,9 +318,16 @@ if [ -f /etc/config/travelmate ]; then
 			WIRELESS_CHANGED=1
 		}
 	done
-	# Start disabled: pasankalla enables/starts travelmate only when WAN is
-	# down, so a WAN-connected boot never runs a scan on the 5 GHz radio.
-	/etc/init.d/travelmate disable >/dev/null 2>&1
+	# Enabled by default (it is a travel router): travelmate starts at boot
+	# and pasankalla only stops it and unplugs its STA from network.trm_wwan
+	# while the ethernet WAN carries the uplink. trm_enabled must be 1 too:
+	# travelmate-service exits on its own with "travelmate is disabled"
+	# otherwise, no matter what the rc.d symlink says.
+	[ "$(uci -q get travelmate.global.trm_enabled)" = 1 ] || {
+		uci -q set travelmate.global.trm_enabled=1
+		TRAVELMATE_CHANGED=1
+	}
+	/etc/init.d/travelmate enable >/dev/null 2>&1
 fi
 
 # --- one-shot service defaults --------------------------------------------

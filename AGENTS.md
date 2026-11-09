@@ -46,9 +46,16 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   `/usr/sbin/pasankalla` state machine moves travelmate between the built-in
   5 GHz and a hot-plugged USB WiFi radio, suspends private APs on the radio
   travelmate scans, drives `white:status`/`red:power` with kernel timer
-  triggers, and logs button/iface/phy events plus state transitions to
-  syslog. At boot it waits `wan_grace` seconds (default 20) for the
-  ethernet WAN DHCP lease before starting travelmate. It keeps the antilag
+  triggers (written only on state change), and logs button/iface/phy events
+  plus state transitions to syslog. At boot it waits `wan_grace` seconds
+  (default 20) for the ethernet WAN DHCP lease before starting travelmate.
+  Travelmate is enabled by default (`trm_enabled=1` plus the rc.d link) and
+  stays enabled; while the WAN owns the uplink pasankalla stops it and
+  unplugs its STAs from `network.trm_wwan` (a STA left on it would outbid
+  the WAN route, metric 100). Which side owns the uplink is kept in
+  `/tmp/pasankalla/tm`: a running travelmate takes its own rc.d link out
+  once nothing is left to scan, so the init's enabled flag must never be
+  used as the state. It keeps the antilag
   instance on the netdev that currently carries the uplink (`ul_if` = WAN
   `l3_device`, or the travelmate STA when WAN is down; `dl_if` =
   `ifb-<dev>`). One-shot service defaults on first boot (`defaults_version`

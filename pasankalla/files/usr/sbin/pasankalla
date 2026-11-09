@@ -11,7 +11,11 @@
 # The guest AP follows the slider (BTN_0): on = enabled. The 5 GHz guest BSS
 # is additionally disabled while travelmate uses that same radio. Travelmate
 # uplinks are moved between the built-in 5 GHz radio and a hot-plugged USB
-# radio; wan always wins and stops travelmate.
+# radio; wan always wins: travelmate is stopped and its STA is unplugged from
+# network.trm_wwan so it cannot outbid the ethernet WAN. Travelmate stays
+# enabled and is started again as soon as the WAN lease is gone; a runtime
+# ledger ($STATE_DIR/tm) remembers which side owns the uplink so the
+# travelmate init being disabled never makes the next poll re-enable it.
 #
 # Event sources: /etc/hotplug.d/button, /etc/hotplug.d/iface,
 # /etc/hotplug.d/ieee80211, plus a 30 s poll from the procd daemon. All
@@ -24,6 +28,7 @@ SLIDER_FILE="$STATE_DIR/slider"
 OFFLINE_FILE="$STATE_DIR/offline_since"
 SIG_FILE="$STATE_DIR/sig"
 DETECT_FILE="$STATE_DIR/detect"
+TM_FILE="$STATE_DIR/tm"
 LOCK_FILE="$STATE_DIR/lock"
 WAN_IF=wan
 WAN6_IF=wan6
@@ -203,17 +208,6 @@ set_radio_disabled() {
 	WIRELESS_CHANGED=1
 }
 
-set_trm_enabled() {
-	[ -f /etc/config/travelmate ] || return 0
-	if ! uci -q get travelmate.global >/dev/null 2>&1; then
-		uci -q set travelmate.global=travelmate
-		TRAVELMATE_CHANGED=1
-	fi
-	[ "$(uci -q get travelmate.global.trm_enabled)" = "$1" ] && return 0
-	uci -q set "travelmate.global.trm_enabled=$1"
-	TRAVELMATE_CHANGED=1
-}
-
 set_trm_radio() {
 	local r="$1" s
 	[ -n "$r" ] || return 0
@@ -380,28 +374,114 @@ tm_running() {
 	[ -x /etc/init.d/travelmate ] && /etc/init.d/travelmate running >/dev/null 2>&1
 }
 
+# trm_wwan is probed by route/lookup for its default route, so a travelmate STA
+# left on it would outbid the WAN route (metric 100) when both have a lease.
+# Plugging and unplugging the network keeps the uplink option in travelmate
+# untouched and never reloads the network (that would bounce the WAN).
+tm_setif() {
+	local ifc="$1" dev
+	dev=$(uci -q get "wireless.$ifc.device")
+	[ -n "$dev" ] || return 0
+	case " $(uci -q get "wireless.$ifc.network") " in
+	*" $TRM_IF "*) ;;
+	*) return 1 ;;
+	esac
+	local list="" s
+	for s in $(uci -q get "wireless.$ifc.network"); do
+		if [ "$s" = "$TRM_IF" ]; then
+			case "$2" in
+			up) list="$list $s" ;;
+			esac
+			continue
+		fi
+		list="$list $s"
+	done
+	[ "$(uci -q get "wireless.$ifc.network")" = "${list# }" ] && return 1
+	uci -q set "wireless.$ifc.network=${list# }"
+	WIRELESS_CHANGED=1
+	log "travelmate uplink \"$dev\" $2 ($TRM_IF)"
+	return 0
+}
+
+# Who owns the uplink, as last applied: 1 = travelmate wanted, 0 = WAN.
+# Reading the init's enabled flag is not a substitute: a running travelmate
+# disables its own service once no uplink is left to scan, so "not enabled"
+# would read back as "WAN owns it" on every poll.
+tm_ledger() {
+	case "$1" in
+	get) cat "$TM_FILE" 2>/dev/null ;;
+	set) echo "$2" > "$TM_FILE" 2>/dev/null ;;
+	esac
+}
+
+# Plugging/unplugging every travelmate STA. With the network option gone
+# the section is not initialized at all, so procd never bumps network.trm_wwan
+# and a scheduled check of ours has no chance to outbid the ethernet WAN.
+tm_stas() {
+	uci -q show wireless 2>/dev/null |
+		sed -n 's/^wireless\.\(trm_uplink[0-9]*\)=wifi-iface$/\1/p'
+}
+
+tm_stas_down() {
+	local s
+	for s in $(tm_stas); do
+		tm_setif "$s" down
+	done
+}
+
+# Stop travelmate. The init is left alone on purpose: procd only fires it on
+# an interface event or a warm boot, and only rc.d decides that. The rc.d
+# link is put back when it is gone, so the next boot starts travelmate even
+# if a running instance removed its own link before the WAN lease arrived
+# (the boot grace window keeps it stopped here, so nothing gets started).
 tm_stop() {
+	local was
+	was=$(tm_ledger get)
+	if [ "$was" = 0 ] && ! tm_running; then
+		TM_DOWN=1
+		if [ -x /etc/init.d/travelmate ] &&
+		   ! /etc/init.d/travelmate enabled >/dev/null 2>&1; then
+			log "travelmate enable"
+			/etc/init.d/travelmate enable >/dev/null 2>&1
+		fi
+		tm_stas_down
+		return 0
+	fi
 	if tm_running; then
 		log "travelmate stop"
 		/etc/init.d/travelmate stop >/dev/null 2>&1
 	fi
-	# Keep travelmate out of the boot sequence while WAN owns the uplink;
-	# tm_start re-enables it when the router actually needs a wwan uplink.
-	if /etc/init.d/travelmate enabled >/dev/null 2>&1; then
-		log "travelmate disable"
-		/etc/init.d/travelmate disable >/dev/null 2>&1
-	fi
+	# Only the first transition of an apply is logged.
+	[ "$TM_DOWN" = 1 ] || log "travelmate stop"
+	TM_DOWN=1
+	tm_ledger set 0
+	tm_stas_down
 	return 0
 }
 
 tm_start() {
+	local was
 	[ -x /etc/init.d/travelmate ] || return 0
+	was=$(tm_ledger get)
+	# travelmate is enabled by default and stays that way. A running
+	# travelmate takes its own rc.d link out once nothing is left to scan,
+	# so the link is only restored when we need it (it was quick to lose,
+	# hence the explicit enable) and a running service is never restarted
+	# just to refresh the link.
 	if ! /etc/init.d/travelmate enabled >/dev/null 2>&1; then
 		log "travelmate enable"
 		/etc/init.d/travelmate enable >/dev/null 2>&1
 	fi
-	log "travelmate start radio=${TRM_RADIO:-none}"
-	/etc/init.d/travelmate start >/dev/null 2>&1
+	TM_DOWN=0
+	tm_ledger set 1
+	[ -n "$was" ] || was=0
+	if [ "$was" != 1 ] && ! tm_running; then
+		log "travelmate start radio=${TRM_RADIO:-none}"
+		/etc/init.d/travelmate start >/dev/null 2>&1
+	elif [ "$RADIO_CHANGED" = 1 ] && tm_running; then
+		log "travelmate restart radio=${TRM_RADIO:-none}"
+		/etc/init.d/travelmate restart >/dev/null 2>&1
+	fi
 	return 0
 }
 
@@ -455,6 +535,11 @@ wifi_reload() {
 	/sbin/wifi reload >/dev/null 2>&1
 }
 
+# LED state left by the last apply. Rewriting trigger and brightness on
+# every poll is pointless work (and a busy LED trigger keeps the CPU from
+# idling); only the diff is written.
+LED_APPLIED=""
+
 led_set() {
 	local base="/sys/class/leds/$1" cur
 	[ -d "$base" ] || return 0
@@ -490,6 +575,10 @@ led_set() {
 }
 
 apply_leds() {
+	if [ "$LED_APPLIED" = "$1" ]; then
+		return 0
+	fi
+	LED_APPLIED="$1"
 	case "$1" in
 	wan)
 		led_set "$LED_WHITE" on
@@ -547,10 +636,10 @@ apply() {
 	SLIDER=0
 	TRM_RADIO=""
 	GUEST_LIST=""
+	TM_DOWN=0
 
 	if [ "$ENABLED" != 1 ]; then
 		tm_stop
-		set_trm_enabled 0
 		GUEST_LIST=$(guest_sections)
 		for s in $GUEST_LIST; do
 			[ "$(uci -q get "wireless.$s")" = wifi-iface ] || continue
@@ -620,17 +709,15 @@ apply() {
 		rm -f "$OFFLINE_FILE"
 	fi
 
-	# WAN wins: stop travelmate before touching wifi so a reload cannot
-	# bring an uplink STA back up. On a radio change, also stop before the
-	# reload and start again afterwards.
+	# WAN wins: stop travelmate and unplug its STA before touching wifi so a
+	# reload cannot bring an uplink back. Travelmate itself stays enabled
+	# (it is enabled by default) so the switch back needs no boot cycle.
+	# A radio switch restarts a running travelmate (see tm_start) instead of
+	# stopping it first: restarting rescans immediately and keeps the ledger
+	# on the travelmate side.
+	TM_DOWN=0
 	if [ "$WANT_TRM" = 0 ]; then
 		tm_stop
-		set_trm_enabled 0
-	elif [ "$RADIO_CHANGED" = 1 ]; then
-		tm_stop
-	fi
-	if [ "$WANT_TRM" = 1 ]; then
-		set_trm_enabled 1
 	fi
 
 	# Only bring the selected travelmate radio up while travelmate is
@@ -640,6 +727,10 @@ apply() {
 	if [ "$WANT_TRM" = 1 ] && [ -n "$TRM_RADIO" ]; then
 		set_radio_disabled "$TRM_RADIO" 0
 		set_trm_radio "$TRM_RADIO"
+		for s in $(tm_stas); do
+			[ "$(uci -q get "wireless.$s.device")" = "$TRM_RADIO" ] &&
+				tm_setif "$s" up
+		done
 	fi
 	# A stale USB radio section (unplugged, or another USB port) must not be
 	# brought up by wifi reload.
@@ -697,11 +788,7 @@ apply() {
 	fi
 
 	if [ "$WANT_TRM" = 1 ]; then
-		if ! tm_running; then
-			tm_start
-		elif [ "$RADIO_CHANGED" = 1 ]; then
-			tm_start
-		fi
+		tm_start
 	fi
 
 	if [ "$WAN" = 1 ]; then
