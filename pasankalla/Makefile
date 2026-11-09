@@ -65,6 +65,9 @@ define Package/pasankalla/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 /etc/init.d/network reload
+# The guest network may have moved from a VLAN device to br-guest; reattach
+# hostapd to the new bridge before the state machine re-enables the BSSes.
+[ -x /sbin/wifi ] && /sbin/wifi reload
 [ -x /etc/init.d/firewall ] && /etc/init.d/firewall reload
 [ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq reload
 /etc/init.d/pasankalla restart
