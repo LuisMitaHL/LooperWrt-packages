@@ -68,24 +68,53 @@ ubus_status() {
 }
 
 ifstatus() {
-	local f
+	local f i n
 	f="/tmp/pasankalla.status.$1.$$"
 	rm -f "$f"
 	( ubus_status "$1" > "$f" 2>/dev/null ) &
 	ubus_pid=$!
-	ubus_n=0
-	while kill -0 "$ubus_pid" 2>/dev/null; do
-		ubus_n=$((ubus_n + 1))
-		if [ "$ubus_n" -ge "$IFSTATUS_TIMEOUT" ]; then
-			# The subshell wraps ubus, so -TERM on it is what ubus gets.
-			kill -TERM "$ubus_pid" 2>/dev/null
-			rm -f "$f"
-			return 1
+	# Poll the REPLY FILE, not the child: ubus writes its JSON a few
+	# milliseconds before it exits, so a loop that kills on the first
+	# "child still alive" check loses every reply and makes wan_ok() see an
+	# interface with no address. This busybox has no fractional sleep and no
+	# usleep, so the first ~200 rounds are a bare stat spin (microseconds of
+	# CPU, a normal reply lands there) and only a reply that still has not
+	# arrived costs a whole second each round, with IFSTATUS_TIMEOUT as the
+	# ceiling. ubus -t 5 is the real bound; this just keeps a wedged ubusd
+	# from holding the apply lock.
+	i=0
+	n=0
+	while :; do
+		if [ -s "$f" ]; then
+			break
 		fi
+		if ! kill -0 "$ubus_pid" 2>/dev/null; then
+			break
+		fi
+		n=$((n + 1))
+		if [ "$n" -ge 200 ]; then
+			n=0
+			i=$((i + 1))
+			if [ "$i" -gt "$IFSTATUS_TIMEOUT" ]; then
+				break
+			fi
+			sleep 1
+		fi
+	done
+	# -TERM is a no-op when it already answered and exited. Never wait
+	# unbounded: a ubus stuck behind a wedged netifd ignores the signal and
+	# an ordinary 'pasankalla status' then sits there for minutes. Give it
+	# two seconds, kill whatever is left and leave the zombie to init.
+	kill -TERM "$ubus_pid" 2>/dev/null
+	i=0
+	while kill -0 "$ubus_pid" 2>/dev/null && [ "$i" -lt 2 ]; do
+		i=$((i + 1))
 		sleep 1
 	done
+	kill -KILL "$ubus_pid" 2>/dev/null
 	cat "$f" 2>/dev/null
 	rm -f "$f"
+	return 0
 }
 
 # Serialize the applies: the daemon poll and every hotplug/menu action fork
@@ -96,12 +125,11 @@ ifstatus() {
 # older than RG_LOCK_MAX seconds.
 RG_LOCK_MAX=120
 # ubus answers within -t on its own; the poll only guards against a child
-# that never returns (ubusd restarting, a stuck netifd). One second is way
+# that never returns (ubusd restarting, a stuck netifd). Five seconds is way
 # above the real reply time (milliseconds) and keeps a dead ubusd from
 # stretching one apply into minutes - an apply with the lock taken is what
 # every other hook waits behind.
-IFSTATUS_TIMEOUT=1
-IFSTATUS_TICKS=1
+IFSTATUS_TIMEOUT=5
 
 
 is_pasankalla_pid() {
@@ -192,8 +220,8 @@ load_cfg() {
 	if ! is_num "$TM_RETRY"; then
 		TM_RETRY=120
 	fi
-	if ! is_num "$IFSTATUS_TIMEOUT"; then
-		IFSTATUS_TIMEOUT=4
+	if ! is_num "$IFSTATUS_TIMEOUT" || [ "$IFSTATUS_TIMEOUT" -lt 1 ] 2>/dev/null; then
+		IFSTATUS_TIMEOUT=5
 	fi
 }
 
@@ -617,29 +645,6 @@ sync_wan_zone() {
 	log "wan zone reloaded: $sig"
 }
 
-ensure_trm_if() {
-	if uci -q get "network.$TRM_IF.device" >/dev/null 2>&1; then
-		return 0
-	fi
-	if [ "$(uci -q get "network.$TRM_IF")" != interface ]; then
-		return 0
-	fi
-	# DSA images (TR3000) create trm_wwan on demand via hotplug, so there is
-	# no empty bridge to stand in; only swconfig (TR1200) needs a device.
-	if [ ! -x /sbin/swconfig ] || [ ! -f /etc/config/network ]; then
-		return 0
-	fi
-	for d in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p'); do
-		[ "$(uci -q get "network.$d.type")" = bridge ] || continue
-		uci -q set "network.$TRM_IF.device=$(uci -q get "network.$d.name")"
-		if uci -q commit network; then
-			log "attach $TRM_IF to $(uci -q get "network.$d.name") for the wan zone"
-		fi
-		return 0
-	done
-	return 0
-}
-
 suspend_aps() {
 	local r="$1" s cur
 	[ -n "$r" ] || return 0
@@ -1004,6 +1009,33 @@ wifi_reload() {
 	/sbin/wifi reload >/dev/null 2>&1 &
 }
 
+# /sbin/wifi hands the work to netifd and returns; netifd then restarts every
+# radio for another ten to twenty seconds on this CPU. Starting travelmate in
+# that window is fatal: it associates, and the reload still in flight tears
+# the fresh STA down (observed on the TR1200 - the failover looked connected
+# and had no route for over a minute). Before travelmate starts, wait until
+# no radio reports pending any more.
+wifi_ready() {
+	local i n p
+	i=0
+	n=0
+	while [ "$i" -lt 45 ]; do
+		p=$(ubus -t 3 call network.wireless status 2>/dev/null |
+			jsonfilter -e '@.*.pending' 2>/dev/null | grep -c true)
+		if [ "$p" = 0 ]; then
+			n=$((n + 1))
+			if [ "$n" -ge 2 ]; then
+				return 0
+			fi
+		else
+			n=0
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+	return 1
+}
+
 # LED state left by the last apply. Rewriting trigger and brightness on
 # every poll is pointless work (and a busy LED trigger keeps the CPU from
 # idling); only the diff is written.
@@ -1101,7 +1133,6 @@ apply() {
 	# An apply killed mid-flight (procd SIGKILL, OOM) leaves its ubus reply
 	# files behind; nothing else in /tmp matches this prefix.
 	rm -f /tmp/pasankalla.status.* 2>/dev/null
-	ensure_trm_if
 
 	WIRELESS_CHANGED=0
 	TRAVELMATE_CHANGED=0
@@ -1198,8 +1229,12 @@ apply() {
 
 	detect_log
 	antilag_update
-	set_trm_radio "$TRM_RADIO" || true
 
+	# Read the radio travelmate owns BEFORE anything writes it, and only
+	# write it while travelmate is wanted (the call sits in the WANT_TRM
+	# branch below). Calling set_trm_radio unconditionally here also plugged
+	# the STA into trm_wwan on every WAN-up poll, which tm_stop then unplugged
+	# again: a wireless change and a wifi reload every single poll.
 	OLD_TRM_RADIO=$(uci -q get travelmate.global.trm_radio)
 	RADIO_CHANGED=0
 	# Only compare/announce the travelmate radio while travelmate is wanted.
@@ -1299,6 +1334,9 @@ apply() {
 	if [ "$WIRELESS_CHANGED" = 1 ]; then
 		if uci -q commit wireless; then
 			wifi_reload
+			if [ "$WANT_TRM" = 1 ]; then
+				wifi_ready || log "wifi still settling after 45s"
+			fi
 		else
 			log "failed to commit wireless"
 			return 1
@@ -1433,7 +1471,7 @@ status() {
 	fi
 	echo "enabled=$ENABLED"
 	echo "guest_network=$GUEST_NET device=$(uci -q get "network.$GUEST_NET.device")"
-	echo "trm_iface=$TRM_IF network=$(uci -q get "network.$TRM_IF.device")"
+	echo "trm_iface=$TRM_IF device=[$(uci -q get "network.$TRM_IF.device")]"
 	echo "wan_link_down=$WAN_LINK_DOWN"
 	echo "slider=$SLIDER"
 	echo "wan=$WAN"
