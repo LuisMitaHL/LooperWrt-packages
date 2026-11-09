@@ -5,6 +5,7 @@
 #   wan     WAN has an address              white solid     red off
 #   wifi    travelmate on built-in 5 GHz    white 1s blink  red off
 #   usb     travelmate on a USB WiFi radio  white 0.25s     red off
+#   usbeth  LTE modem / USB Ethernet dongle  white 0.25s     red off
 #   offline no internet after the grace     white off       red 1s blink
 #   disabled master switch off              both off
 #
@@ -49,6 +50,12 @@ WAN6_IF=wan6
 TRM_IF=trm_wwan
 TRM6_IF=trm_wwan6
 TRM_IFACE=trm_wwan
+# Second fallback uplink: a USB Ethernet adapter or an LTE modem stick. It
+# sits below travelmate on purpose (metric 200 against trm_wwan's 100), so a
+# working Wi-Fi uplink always wins over the modem.
+USB_ETH_IF=wanusb
+USB_ETH6_IF=wanusb6
+USB_ETH_METRIC=200
 
 log() {
 	logger -t pasankalla "$*" 2>/dev/null
@@ -196,6 +203,7 @@ load_cfg() {
 	WAN_DOWN_AFTER=$(cfg wan_down_after 30)
 	WAN_PROBE_INTERVAL=$(cfg wan_probe_interval 20)
 	TM_RETRY=$(cfg travelmate_retry 120)
+	USB_ETH_ENABLED=$(cfg usb_eth_uplink 1)
 	LED_WHITE=$(cfg led_white 'white:status')
 	LED_RED=$(cfg led_red 'red:power')
 
@@ -471,6 +479,70 @@ iface_l3dev() {
 	echo "$d"
 }
 
+# Ethernet netdevs sitting behind a USB device: an LTE modem stick
+# (cdc-ncm/ecm, HiLink) or a USB Ethernet dongle. A USB WiFi radio also
+# exposes netdevs on its USB device (the travelmate STA), so anything with a
+# phy80211 link is skipped. Virtual netdevs (br-*, eth0.2, ifb-*) resolve
+# their "device" link into /sys/devices/virtual and never match.
+usb_eth_devs() {
+	local d n t
+	for d in /sys/class/net/*; do
+		n=${d##*/}
+		if [ -e "$d/phy80211" ]; then
+			continue
+		fi
+		read -r t < "$d/type" 2>/dev/null
+		if [ "$t" != 1 ]; then
+			continue
+		fi
+		case "$(readlink -f "$d/device" 2>/dev/null)" in
+		*usb*) echo "$n" ;;
+		esac
+	done
+}
+
+usb_eth_dev() {
+	local n c
+	for n in $(usb_eth_devs); do
+		# A modem that is still dialling has no carrier yet; prefer a
+		# dongle that already sees one, and fall back to the first.
+		c=$(cat "/sys/class/net/$n/carrier" 2>/dev/null)
+		if [ "$c" = 1 ]; then
+			echo "$n"
+			return 0
+		fi
+	done
+	usb_eth_devs | head -n1
+}
+
+# Keep $USB_ETH_IF pointed at the dongle that is actually plugged in. The
+# interface itself (proto dhcp, metric 200) comes from zz-pasankalla; only
+# the device changes here, and a plug/unplug is the one case that pays for a
+# network reload (see NET_RELOAD in apply).
+usb_eth_sync() {
+	local dev cur
+	[ "$(uci -q get "network.$USB_ETH_IF")" = interface ] || return 0
+	dev=$(usb_eth_dev)
+	USB_ETH_DEV="$dev"
+	cur=$(uci -q get "network.$USB_ETH_IF.device")
+	case "$cur" in
+	''|null) cur="" ;;
+	esac
+	if [ "$cur" = "$dev" ]; then
+		return 0
+	fi
+	if [ -z "$dev" ]; then
+		uci -q delete "network.$USB_ETH_IF.device"
+	else
+		uci -q set "network.$USB_ETH_IF.device=$dev"
+	fi
+	if uci -q commit network; then
+		NET_RELOAD=1
+		log "usb uplink device ${cur:-none} -> ${dev:-none}"
+	fi
+	return 0
+}
+
 radio_list() {
 	uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'
 }
@@ -642,7 +714,7 @@ WAN_ZONE_SIG=""
 fw_zone_sig() {
 	for z in $(uci -q show firewall 2>/dev/null | sed -n 's/^firewall\.\([^.=]*\)=zone$/\1/p'); do
 		case " $(uci -q get "firewall.$z.network") " in
-		*" $WAN_IF "*|*" $WAN6_IF "*|*" $TRM_IF "*|*" $TRM6_IF "*)
+		*" $WAN_IF "*|*" $WAN6_IF "*|*" $TRM_IF "*|*" $TRM6_IF "*|*" $USB_ETH_IF "*|*" $USB_ETH6_IF "*)
 			echo "$z $(uci -q get "firewall.$z.network")"
 			;;
 		esac
@@ -965,8 +1037,9 @@ antilag_update() {
 	sec=$(antilag_section)
 	[ -n "$sec" ] || return 0
 
-	# Wired WAN down and travelmate without a lease: nothing to shape.
-	if [ "$WAN" = 0 ] && [ "$TRM_LEASE" = 0 ]; then
+	# No uplink at all (wired down, no travelmate lease, no modem): nothing
+	# to shape.
+	if [ "$WAN" = 0 ] && [ "$TRM_LEASE" = 0 ] && [ "$USB_ETH_LEASE" = 0 ]; then
 		antilag_set_state 0
 		return 0
 	fi
@@ -981,6 +1054,9 @@ antilag_update() {
 	fi
 	if [ -z "$dev" ] && [ "$TRM_LEASE" = 1 ]; then
 		dev=$(iface_l3dev "$TRM_IF")
+	fi
+	if [ -z "$dev" ] && [ "$USB_ETH_LEASE" = 1 ]; then
+		dev=$(iface_l3dev "$USB_ETH_IF")
 	fi
 	if [ -z "$dev" ]; then
 		dev=$(iface_l3dev "$WAN_IF")
@@ -1107,7 +1183,7 @@ apply_leds() {
 		led_set "$LED_WHITE" timer 1000
 		led_set "$LED_RED" off
 		;;
-	usb)
+	usb|usbeth)
 		led_set "$LED_WHITE" timer 250
 		led_set "$LED_RED" off
 		;;
@@ -1126,22 +1202,22 @@ apply_leds() {
 # already the primary debugging surface for the state machine.
 detect_log() {
 	local sig
-	sig="$WAN|$WAN_WAIT|$USB_PRESENT|$USB_ACTIVE|$TRM_LEASE|$SLIDER|$TRM_RADIO|$WANT_TRM"
+	sig="$WAN|$WAN_WAIT|$USB_PRESENT|$USB_ACTIVE|$TRM_LEASE|$USB_ETH_DEV|$USB_ETH_LEASE|$SLIDER|$TRM_RADIO|$WANT_TRM"
 	if [ "$(cat "$DETECT_FILE" 2>/dev/null)" = "$sig" ]; then
 		return 0
 	fi
-	log "detect wan=$WAN wan_wait=$WAN_WAIT usb_present=$USB_PRESENT usb_active=$USB_ACTIVE trm_lease=$TRM_LEASE slider=$SLIDER radio=${TRM_RADIO:-none} want_trm=$WANT_TRM"
+	log "detect wan=$WAN wan_wait=$WAN_WAIT usb_present=$USB_PRESENT usb_active=$USB_ACTIVE trm_lease=$TRM_LEASE usb_eth=${USB_ETH_DEV:-none} usb_eth_lease=$USB_ETH_LEASE slider=$SLIDER radio=${TRM_RADIO:-none} want_trm=$WANT_TRM"
 	echo "$sig" > "$DETECT_FILE" 2>/dev/null
 }
 
 state_log() {
 	local state="$1" sig prev
 	prev=$(cut -d'|' -f1 "$SIG_FILE" 2>/dev/null)
-	sig="$state|$WAN|$WAN_WAIT|$USB_PRESENT|$USB_ACTIVE|$TRM_LEASE|$SLIDER|$TRM_RADIO|$WANT_TRM"
+	sig="$state|$WAN|$WAN_WAIT|$USB_PRESENT|$USB_ACTIVE|$TRM_LEASE|$USB_ETH_DEV|$USB_ETH_LEASE|$SLIDER|$TRM_RADIO|$WANT_TRM"
 	if [ "$(cat "$SIG_FILE" 2>/dev/null)" = "$sig" ]; then
 		return 0
 	fi
-	log "state ${prev:-none} -> $state wan=$WAN wan_wait=$WAN_WAIT usb_present=$USB_PRESENT usb_active=$USB_ACTIVE trm_lease=$TRM_LEASE slider=$SLIDER radio=${TRM_RADIO:-none} want_trm=$WANT_TRM"
+	log "state ${prev:-none} -> $state wan=$WAN wan_wait=$WAN_WAIT usb_present=$USB_PRESENT usb_active=$USB_ACTIVE trm_lease=$TRM_LEASE usb_eth=${USB_ETH_DEV:-none} usb_eth_lease=$USB_ETH_LEASE slider=$SLIDER radio=${TRM_RADIO:-none} want_trm=$WANT_TRM"
 	echo "$sig" > "$SIG_FILE" 2>/dev/null
 }
 
@@ -1162,6 +1238,9 @@ apply() {
 	GUEST_LIST=""
 	TM_DOWN=0
 	USB_PRESENT=0
+	USB_ETH_DEV=""
+	USB_ETH_LEASE=0
+	NET_RELOAD=0
 
 	if [ "$ENABLED" != 1 ]; then
 		tm_stop
@@ -1205,6 +1284,17 @@ apply() {
 	trm_ok && TRM_LEASE=1
 	if [ "$TRM_LEASE" = 1 ]; then
 		rm -f "$TM_RETRY_FILE" 2>/dev/null
+	fi
+	# The USB modem/dongle is the last fallback, below travelmate. Its
+	# interface only exists once zz-pasankalla has run (fresh image or the
+	# first boot after the upgrade that added it).
+	if [ "$USB_ETH_ENABLED" = 1 ]; then
+		usb_eth_sync
+	fi
+	if [ -n "$USB_ETH_DEV" ]; then
+		if iface_v4 "$USB_ETH_IF" || iface_v6 "$USB_ETH6_IF"; then
+			USB_ETH_LEASE=1
+		fi
 	fi
 
 	USB_RADIO=""
@@ -1398,6 +1488,12 @@ apply() {
 			state=usb
 		fi
 		rm -f "$OFFLINE_FILE"
+	elif [ "$USB_ETH_LEASE" = 1 ]; then
+		# The modem/dongle carries the uplink. It is a USB uplink like the
+		# USB WiFi radio, so it shares the fast blink; the log and status
+		# name the source.
+		state=usbeth
+		rm -f "$OFFLINE_FILE"
 	elif [ "$WAN_WAIT" = 1 ]; then
 		# WAN may still lease; show the travelmate "searching" blink rather
 		# than claiming the router is offline.
@@ -1421,6 +1517,12 @@ apply() {
 	fi
 
 	sync_wan_zone
+	# A dongle was plugged in or pulled: netifd has to re-read the device
+	# before the modem interface can come up (or be torn down).
+	if [ "$NET_RELOAD" = 1 ]; then
+		ubus -t 5 call network reload >/dev/null 2>&1
+		log "network reloaded: usb uplink device"
+	fi
 	apply_leds "$state"
 	state_log "$state"
 	return 0
@@ -1513,6 +1615,13 @@ status() {
 	echo "wan=$WAN"
 	echo "wan_wait=$WAN_WAIT"
 	echo "usb_present=$USB_PRESENT"
+	echo "usb_eth_dev=$(usb_eth_dev)"
+	echo "usb_eth_iface=$USB_ETH_IF device=[$(uci -q get "network.$USB_ETH_IF.device")]"
+	USB_ETH_LEASE=0
+	if iface_v4 "$USB_ETH_IF" || iface_v6 "$USB_ETH6_IF"; then
+		USB_ETH_LEASE=1
+	fi
+	echo "usb_eth_lease=$USB_ETH_LEASE"
 	USB_ACTIVE=0
 	if [ "$WAN" = 0 ] && [ "$WAN_WAIT" = 0 ] && [ -n "$USB_RADIO" ] && [ "$USB_RADIO" = "$TRM_RADIO" ]; then
 		USB_ACTIVE=1

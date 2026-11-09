@@ -59,7 +59,14 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   instance on the netdev that currently carries the uplink (`ul_if` = WAN
   `l3_device`, or the travelmate STA when WAN is down; `dl_if` =
   `ifb-<dev>`) and stops antilag entirely while there is no uplink at all
-  (a dead link only produces stall/reflector churn);
+  (a dead link only produces stall/reflector churn). A USB LTE modem or
+  USB Ethernet dongle is an extra uplink ranked BELOW travelmate: `zz-pasankalla` creates `wanusb` (dhcp, metric 200) and
+  `wanusb6` in the wan zone, and the daemon points
+  `network.wanusb.device` at the detected netdev (a `/sys/class/net` node
+  whose `device` path contains `usb`, type 1, and with no `phy80211`, so
+  the USB WiFi STA is never mistaken for a modem), reloading the network
+  only when that device changes and reporting the `usbeth` state (same
+  fast blink as a USB WiFi uplink);
   one-shot service defaults on first boot (`defaults_version`
   marker): antilag enabled on the WAN netdev, tailscale and tswatchdog
   stopped and disabled when installed. swconfig targets (mt7628) keep

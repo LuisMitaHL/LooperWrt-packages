@@ -13,6 +13,9 @@
 #     a real bridge is required so hostapd can attach the guest BSSes and
 #     run ap_isolate/proxy_arp (x_snoop rejects a bridge-less interface);
 #   * trm_wwan/trm_wwan6 in the wan firewall zone, for travelmate;
+#   * wanusb/wanusb6 in the wan firewall zone, the lower-priority uplink a
+#     USB LTE modem or USB Ethernet dongle provides (metric 200, below
+#     travelmate's 100); its device is set at runtime by pasankalla;
 #   * one OWE-only guest AP per built-in band, SSID "Pasankalla gratis",
 #     disabled until the slider is turned on;
 #   * the travelmate trm_iface/trm_radio baseline; travelmate is enabled by
@@ -26,6 +29,9 @@ CONFIG=pasankalla
 GUEST_NET=lanclientes
 TRM_IF=trm_wwan
 TRM6_IF=trm_wwan6
+USB_ETH_IF=wanusb
+USB_ETH6_IF=wanusb6
+USB_ETH_METRIC=200
 
 notice() {
 	echo "pasankalla: $*" > /dev/kmsg 2>/dev/null
@@ -201,11 +207,32 @@ if ! uci -q get "network.$TRM6_IF" >/dev/null 2>&1; then
 	NETWORK_CHANGED=1
 fi
 
+# The USB uplink is a plain DHCP client on whatever netdev the daemon finds
+# (an LTE modem in NCM/ECM mode or a USB Ethernet dongle). No device is set
+# here: netifd keeps the interface down until pasankalla points it at a
+# dongle that is really plugged in.
+if ! uci -q get "network.$USB_ETH_IF" >/dev/null 2>&1; then
+	uci -q set "network.$USB_ETH_IF=interface"
+	uci -q set "network.$USB_ETH_IF.proto=dhcp"
+	uci -q set "network.$USB_ETH_IF.metric=$USB_ETH_METRIC"
+	NETWORK_CHANGED=1
+fi
+if ! uci -q get "network.$USB_ETH6_IF" >/dev/null 2>&1; then
+	uci -q set "network.$USB_ETH6_IF=interface"
+	uci -q set "network.$USB_ETH6_IF.proto=dhcpv6"
+	uci -q set "network.$USB_ETH6_IF.device=@$USB_ETH_IF"
+	uci -q set "network.$USB_ETH6_IF.reqaddress=try"
+	uci -q set "network.$USB_ETH6_IF.reqprefix=no"
+	NETWORK_CHANGED=1
+fi
+
 if [ -f /etc/config/firewall ]; then
 	wan_zone=$(zone_id wan)
 	[ -n "$wan_zone" ] || wan_zone=$(uci -q show firewall | sed -n 's/^firewall\.\([^.=]*\)\.masq=.1.$/\1/p' | head -n1)
 	add_zone_network "$wan_zone" "$TRM_IF"
 	add_zone_network "$wan_zone" "$TRM6_IF"
+	add_zone_network "$wan_zone" "$USB_ETH_IF"
+	add_zone_network "$wan_zone" "$USB_ETH6_IF"
 	if [ "$GUEST_NET_OK" = 1 ]; then
 		lan_zone=$(zone_id lan)
 		add_zone_network "$lan_zone" "$GUEST_NET"

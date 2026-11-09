@@ -58,13 +58,20 @@ config pasankalla 'settings'
 	# restart flaps its STA, so this must stay well above one scan. 0 disables.
 	option travelmate_retry '120'
 
+	# USB uplink: a USB LTE modem (cdc-ncm/ecm, HiLink) or a USB Ethernet
+	# dongle is used as an extra uplink. It sits BELOW travelmate (interface
+	# wanusb, metric 200 vs trm_wwan's 100), so a working Wi-Fi uplink
+	# always wins over the modem. The interface is created by
+	# zz-pasankalla; the device is set at runtime. 0 disables the feature.
+	option usb_eth_uplink '1'
+
 	# sysfs LED names (both boards expose these labels from their DTS).
 	option led_white 'white:status'
 	option led_red 'red:power'
 
 	# Internal one-shot marker: zz-pasankalla sets this to 1 after pointing
-	# antilag at the WAN netdev and enabling it. Do not set it by hand.
-	# (Tailscale used to be disabled here too; it is no longer touched.)
+	# antilag at the WAN netdev, enabling it, and stopping/disabling
+	# tailscale + tswatchdog when installed. Do not set it by hand.
 	option defaults_version '0'
 
 	# Managed by zz-pasankalla: wifi-iface section names that belong to the
