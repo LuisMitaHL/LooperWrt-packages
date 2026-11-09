@@ -38,7 +38,7 @@ define Package/pasankalla/description
 
   Adds an OWE-only guest AP with SSID "Pasankalla gratis" on the built-in
   2.4/5 GHz radios, enabled only while the case slider (BTN_0) is on. The
-  guest network uses a dedicated VLAN/subnet (100.102.13.37/16 by default),
+  guest network uses a dedicated bridge/subnet (100.102.13.37/16 by default),
   lives in the lan firewall zone like the original Pasankalla setup, and is
   disabled on the 5 GHz radio while travelmate uses that same radio as its
   wwan uplink.

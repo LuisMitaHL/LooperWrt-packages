@@ -12,4 +12,5 @@ case "$INTERFACE" in
 	*) exit 0 ;;
 esac
 
+logger -t pasankalla "iface $INTERFACE $ACTION" 2>/dev/null
 /usr/sbin/pasankalla apply >/dev/null 2>&1 &

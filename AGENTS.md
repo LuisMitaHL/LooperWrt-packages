@@ -40,13 +40,14 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   `ap` profile via `configs/ap.config`.
 - `pasankalla` is feed-native (no vendor repo): Cudy TR3000/TR1200
   travel-router defaults. `zz-pasankalla` creates the guest `lanclientes`
-  VLAN/subnet + DHCP + firewall membership and one OWE-only `Pasankalla gratis`
+  bridge/subnet + DHCP + firewall membership and one OWE-only `Pasankalla gratis`
   AP per built-in band (disabled until the slider is on), adopting an existing
   open+hidden-OWE transition pair on an already-configured router. The
   `/usr/sbin/pasankalla` state machine moves travelmate between the built-in
   5 GHz and a hot-plugged USB WiFi radio, suspends private APs on the radio
-  travelmate scans, and drives `white:status`/`red:power` with kernel timer
-  triggers. At boot it waits `wan_grace` seconds (default 20) for the
+  travelmate scans, drives `white:status`/`red:power` with kernel timer
+  triggers, and logs button/iface/phy events plus state transitions to
+  syslog. At boot it waits `wan_grace` seconds (default 20) for the
   ethernet WAN DHCP lease before starting travelmate. Selected only on
   `pasankalla`/`pasankalla_lite` via `configs/pasankalla.config`.
 - Commit style: plain descriptive subject (see `git log`). The user controls

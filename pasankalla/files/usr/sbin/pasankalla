@@ -23,6 +23,7 @@ STATE_DIR=/tmp/pasankalla
 SLIDER_FILE="$STATE_DIR/slider"
 OFFLINE_FILE="$STATE_DIR/offline_since"
 SIG_FILE="$STATE_DIR/sig"
+DETECT_FILE="$STATE_DIR/detect"
 LOCK_FILE="$STATE_DIR/lock"
 WAN_IF=wan
 WAN6_IF=wan6
@@ -363,22 +364,32 @@ tm_running() {
 }
 
 tm_stop() {
-	tm_running && /etc/init.d/travelmate stop >/dev/null 2>&1
+	if tm_running; then
+		log "travelmate stop"
+		/etc/init.d/travelmate stop >/dev/null 2>&1
+	fi
 	# Keep travelmate out of the boot sequence while WAN owns the uplink;
 	# tm_start re-enables it when the router actually needs a wwan uplink.
-	/etc/init.d/travelmate enabled >/dev/null 2>&1 &&
+	if /etc/init.d/travelmate enabled >/dev/null 2>&1; then
+		log "travelmate disable"
 		/etc/init.d/travelmate disable >/dev/null 2>&1
+	fi
 	return 0
 }
 
 tm_start() {
 	[ -x /etc/init.d/travelmate ] || return 0
-	/etc/init.d/travelmate enabled >/dev/null 2>&1 || /etc/init.d/travelmate enable >/dev/null 2>&1
+	if ! /etc/init.d/travelmate enabled >/dev/null 2>&1; then
+		log "travelmate enable"
+		/etc/init.d/travelmate enable >/dev/null 2>&1
+	fi
+	log "travelmate start radio=${TRM_RADIO:-none}"
 	/etc/init.d/travelmate start >/dev/null 2>&1
 	return 0
 }
 
 wifi_reload() {
+	log "wifi reload"
 	/sbin/wifi reload >/dev/null 2>&1
 }
 
@@ -441,13 +452,24 @@ apply_leds() {
 	esac
 }
 
+# Log only changes, not every poll: this runs on a weak CPU and syslog is
+# already the primary debugging surface for the state machine.
+detect_log() {
+	local sig
+	sig="$WAN|$WAN_WAIT|$USB_PRESENT|$USB_ACTIVE|$TRM_LEASE|$SLIDER|$TRM_RADIO|$WANT_TRM"
+	[ "$(cat "$DETECT_FILE" 2>/dev/null)" = "$sig" ] && return 0
+	log "detect wan=$WAN wan_wait=$WAN_WAIT usb_present=$USB_PRESENT usb_active=$USB_ACTIVE trm_lease=$TRM_LEASE slider=$SLIDER radio=${TRM_RADIO:-none} want_trm=$WANT_TRM"
+	echo "$sig" > "$DETECT_FILE" 2>/dev/null
+}
+
 state_log() {
-	local state="$1" sig
-	sig="$state|$WAN|$USB_ACTIVE|$TRM_LEASE|$SLIDER|$TRM_RADIO"
+	local state="$1" sig prev
+	prev=$(cut -d'|' -f1 "$SIG_FILE" 2>/dev/null)
+	sig="$state|$WAN|$WAN_WAIT|$USB_PRESENT|$USB_ACTIVE|$TRM_LEASE|$SLIDER|$TRM_RADIO|$WANT_TRM"
 	if [ "$(cat "$SIG_FILE" 2>/dev/null)" = "$sig" ]; then
 		return 0
 	fi
-	log "state=$state wan=$WAN usb=$USB_ACTIVE trm_lease=$TRM_LEASE slider=$SLIDER radio=${TRM_RADIO:-none}"
+	log "state ${prev:-none} -> $state wan=$WAN wan_wait=$WAN_WAIT usb_present=$USB_PRESENT usb_active=$USB_ACTIVE trm_lease=$TRM_LEASE slider=$SLIDER radio=${TRM_RADIO:-none} want_trm=$WANT_TRM"
 	echo "$sig" > "$SIG_FILE" 2>/dev/null
 }
 
@@ -518,9 +540,14 @@ apply() {
 	slider_on && SLIDER=1
 	GUEST_LIST=$(guest_sections)
 
+	detect_log
+
 	OLD_TRM_RADIO=$(uci -q get travelmate.global.trm_radio)
 	RADIO_CHANGED=0
-	[ "$OLD_TRM_RADIO" != "$TRM_RADIO" ] && RADIO_CHANGED=1
+	if [ "$OLD_TRM_RADIO" != "$TRM_RADIO" ]; then
+		RADIO_CHANGED=1
+		log "radio ${OLD_TRM_RADIO:-none} -> ${TRM_RADIO:-none}"
+	fi
 	# A radio switch (USB plugged/unplugged) gets a fresh grace period, so
 	# the LED shows the new fast/slow blink before falling back to red.
 	if [ "$WANT_TRM" = 1 ] && [ "$RADIO_CHANGED" = 1 ]; then
@@ -586,6 +613,7 @@ apply() {
 			set_radio_disabled "$dev" 0
 		fi
 		[ "$(uci -q get "wireless.$s.disabled")" = "$desired" ] && continue
+		log "guest $s disabled=$desired"
 		uci -q set "wireless.$s.disabled=$desired"
 		WIRELESS_CHANGED=1
 	done

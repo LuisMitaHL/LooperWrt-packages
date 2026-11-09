@@ -9,4 +9,5 @@ case "$ACTION" in
 	*) exit 0 ;;
 esac
 
+logger -t pasankalla "ieee80211 $ACTION ${DEVPATH:-unknown}" 2>/dev/null
 /usr/sbin/pasankalla apply >/dev/null 2>&1 &

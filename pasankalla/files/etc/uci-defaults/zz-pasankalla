@@ -8,9 +8,10 @@
 # open+hidden-OWE transition pair instead of creating duplicate BSSes.
 #
 # It creates (only when missing):
-#   * lanclientes: a dedicated guest interface (br-lan.10 when a br-lan
-#     bridge exists, otherwise a local br-guest bridge), 100.102.13.37/16,
-#     in the lan firewall zone, with a DHCP server;
+#   * lanclientes: a dedicated guest interface on a local br-guest bridge,
+#     100.102.13.37/16, in the lan firewall zone, with a DHCP server;
+#     a real bridge is required so hostapd can attach the guest BSSes and
+#     run ap_isolate/proxy_arp (x_snoop rejects a bridge-less interface);
 #   * trm_wwan/trm_wwan6 in the wan firewall zone, for travelmate;
 #   * one OWE-only guest AP per built-in band, SSID "Pasankalla gratis",
 #     disabled until the slider is turned on;
@@ -25,8 +26,6 @@ CONFIG=pasankalla
 GUEST_NET=lanclientes
 TRM_IF=trm_wwan
 TRM6_IF=trm_wwan6
-VLAN_ID=10
-VLAN_DEV=br-lan.10
 
 notice() {
 	echo "pasankalla: $*" > /dev/kmsg 2>/dev/null
@@ -55,48 +54,6 @@ add_zone_network() {
 	esac
 	uci -q add_list "firewall.$z.network=$n"
 	FIREWALL_CHANGED=1
-}
-
-find_bridge_vlan() {
-	local s
-	for s in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=bridge-vlan$/\1/p'); do
-		[ "$(uci -q get "network.$s.device")" = "$1" ] || continue
-		[ "$(uci -q get "network.$s.vlan")" = "$VLAN_ID" ] && { echo "$s"; return 0; }
-	done
-	return 1
-}
-
-# Any bridge-vlan entry on the bridge means the bridge is VLAN-filtering, so
-# the guest VLAN must be a bridge-vlan too (an 8021q device on top of it would
-# not be tagged by the switch).
-find_any_bridge_vlan() {
-	local s
-	for s in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=bridge-vlan$/\1/p'); do
-		[ "$(uci -q get "network.$s.device")" = "$1" ] && { echo "$s"; return 0; }
-	done
-	return 1
-}
-
-# Tag the LAN port(s) for the guest VLAN, matching the original TR3000 setup
-# (eth1 becomes eth1:t). Without ports the VLAN exists only locally, which is
-# enough for the guest BSSes but not for a tagged wired guest port.
-bridge_vlan_ports() {
-	local dev="$1" s vlan1="" ports="" p
-	for s in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=bridge-vlan$/\1/p'); do
-		[ "$(uci -q get "network.$s.device")" = "$dev" ] || continue
-		[ "$(uci -q get "network.$s.vlan")" = 1 ] || continue
-		vlan1=$(uci -q get "network.$s.ports")
-		break
-	done
-	if [ -z "$vlan1" ]; then
-		s=$(find_dev "$dev")
-		[ -n "$s" ] && vlan1=$(uci -q get "network.$s.ports")
-	fi
-	for p in $vlan1; do
-		p=$(echo "$p" | cut -d: -f1)
-		[ -n "$p" ] && ports="$ports $p:t"
-	done
-	echo "$ports" | sed 's/^ //'
 }
 
 find_dhcp_iface() {
@@ -155,65 +112,37 @@ TRAVELMATE_CHANGED=0
 PASANKALLA_CHANGED=0
 GUEST_NET_OK=0
 
-# --- guest network: dedicated guest device + lanclientes ------------------
-# The original TR3000 used br-lan.10. Keep that when a br-lan bridge exists
-# (DSA bridge-vlan or a plain 8021q on the bridge), but swconfig targets such
-# as the TR1200 have no br-lan device at all -- there the guest BSSes get
-# their own empty bridge, which also keeps guest traffic off the LAN ports.
-if uci -q get "network.$GUEST_NET" >/dev/null 2>&1; then
-	GUEST_NET_OK=1
-else
-	brdev=$(find_dev br-lan)
-	if [ -n "$brdev" ]; then
-		GUEST_NET_OK=1
-		# find_dev returns the section id; bridge-vlan entries refer to
-		# the bridge by its device name.
-		brdev_name=$(uci -q get "network.$brdev.name")
-		[ -n "$brdev_name" ] || brdev_name=br-lan
-		# A bridge-vlan entry already creates br-lan.<vid> (the live
-		# TR3000 setup uses this). Any bridge-vlan on the bridge means
-		# VLAN filtering is in use, so the guest VLAN must be a
-		# bridge-vlan too; only a plain bridge gets an 8021q device.
-		if find_bridge_vlan "$brdev_name" >/dev/null; then
-			:
-		elif [ -n "$(find_any_bridge_vlan "$brdev_name")" ] ||
-		     [ "$(uci -q get "network.$brdev.vlan_filtering")" = 1 ]; then
-			# DSA bridge with VLAN filtering: match the original
-			# Pasankalla config, including the tagged LAN port(s).
-			uci -q add network bridge-vlan
-			uci -q set "network.@bridge-vlan[-1].device=$brdev_name"
-			uci -q set "network.@bridge-vlan[-1].vlan=$VLAN_ID"
-			vlan_ports=$(bridge_vlan_ports "$brdev_name")
-			[ -n "$vlan_ports" ] && \
-				uci -q set "network.@bridge-vlan[-1].ports=$vlan_ports"
-			NETWORK_CHANGED=1
-		elif [ -z "$(find_dev "$VLAN_DEV")" ]; then
-			uci -q add network device
-			uci -q set "network.@device[-1].name=$VLAN_DEV"
-			uci -q set "network.@device[-1].type=8021q"
-			uci -q set "network.@device[-1].ifname=br-lan"
-			uci -q set "network.@device[-1].vid=$VLAN_ID"
-			NETWORK_CHANGED=1
-		fi
-		guest_dev="$VLAN_DEV"
-	else
-		# swconfig / no br-lan: an empty bridge is enough. hostapd adds the
-		# guest BSS netdevs to it when wifi starts.
-		GUEST_NET_OK=1
-		if [ -z "$(find_dev br-guest)" ]; then
-			uci -q set network.guestdev=device
-			uci -q set network.guestdev.name=br-guest
-			uci -q set network.guestdev.type=bridge
-			uci -q set network.guestdev.bridge_empty=1
-			NETWORK_CHANGED=1
-		fi
-		guest_dev=br-guest
-	fi
+# --- guest network: dedicated guest bridge + lanclientes -------------------
+# hostapd attaches a BSS to the bridge of its "network" interface and writes
+# bridge=<name>. With ap_isolate/proxy_arp, x_snoop also requires a real
+# bridge; a VLAN device such as br-lan.10 is not one. Give the guest network
+# its own empty bridge: this starts hostapd and keeps guest L2 traffic off
+# the LAN ports.
+GUEST_NET_OK=1
+guest_dev=br-guest
+guest_s=$(find_dev br-guest)
+if [ -z "$guest_s" ]; then
+	guest_s=guestdev
+	uci -q set "network.$guest_s=device"
+	uci -q set "network.$guest_s.name=$guest_dev"
+	uci -q set "network.$guest_s.type=bridge"
+	uci -q set "network.$guest_s.bridge_empty=1"
+	NETWORK_CHANGED=1
+elif [ "$(uci -q get "network.$guest_s.type")" != bridge ] ||
+     [ "$(uci -q get "network.$guest_s.bridge_empty")" != 1 ]; then
+	uci -q set "network.$guest_s.type=bridge"
+	uci -q set "network.$guest_s.bridge_empty=1"
+	NETWORK_CHANGED=1
+fi
+if [ "$(uci -q get "network.$GUEST_NET")" != interface ]; then
 	uci -q set "network.$GUEST_NET=interface"
 	uci -q set "network.$GUEST_NET.proto=static"
-	uci -q set "network.$GUEST_NET.device=$guest_dev"
 	uci -q set "network.$GUEST_NET.ipaddr=100.102.13.37"
 	uci -q set "network.$GUEST_NET.netmask=255.255.0.0"
+	NETWORK_CHANGED=1
+fi
+if [ "$(uci -q get "network.$GUEST_NET.device")" != "$guest_dev" ]; then
+	uci -q set "network.$GUEST_NET.device=$guest_dev"
 	NETWORK_CHANGED=1
 fi
 

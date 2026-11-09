@@ -11,10 +11,12 @@ esac
 
 mkdir -p /tmp/pasankalla
 if [ "$ACTION" = "pressed" ]; then
-	echo 1 > /tmp/pasankalla/slider
+	state=1
 else
-	echo 0 > /tmp/pasankalla/slider
+	state=0
 fi
+echo "$state" > /tmp/pasankalla/slider
+logger -t pasankalla "button BTN_0 $ACTION slider=$state" 2>/dev/null
 
 # Do not block the hotplug caller: applying a slider change may reload wifi.
 /usr/sbin/pasankalla apply >/dev/null 2>&1 &
