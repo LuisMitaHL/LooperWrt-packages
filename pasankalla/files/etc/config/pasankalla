@@ -47,6 +47,12 @@ config pasankalla 'settings'
 	# renegotiation. 0 disables the check.
 	option wan_down_after '30'
 
+	# The switch-port probe behind wan_down_after costs ~0.4 s of CPU on the
+	# TR1200. The debounce is timestamp based, so the verdict is cached for
+	# this many seconds: a dead port is still noticed, for a fraction of the
+	# cost. Values below 5 are raised to 5.
+	option wan_probe_interval '20'
+
 	# How often to look for travelmate while it is the uplink and has no
 	# lease (seconds). Restarting it makes wpa_supplicant scan again; every
 	# restart flaps its STA, so this must stay well above one scan. 0 disables.

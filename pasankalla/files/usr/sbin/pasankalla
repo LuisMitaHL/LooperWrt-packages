@@ -28,6 +28,7 @@ STATE_DIR=/tmp/pasankalla
 SLIDER_FILE="$STATE_DIR/slider"
 OFFLINE_FILE="$STATE_DIR/offline_since"
 WAN_LINK_FILE="$STATE_DIR/wan_link_down"
+WAN_PROBE_FILE="$STATE_DIR/wan_probe"
 SIG_FILE="$STATE_DIR/sig"
 DETECT_FILE="$STATE_DIR/detect"
 TM_FILE="$STATE_DIR/tm"
@@ -162,6 +163,7 @@ load_cfg() {
 	OFFLINE_AFTER=$(cfg offline_after 60)
 	POLL_INTERVAL=$(cfg poll_interval 10)
 	WAN_DOWN_AFTER=$(cfg wan_down_after 30)
+	WAN_PROBE_INTERVAL=$(cfg wan_probe_interval 20)
 	TM_RETRY=$(cfg travelmate_retry 120)
 	LED_WHITE=$(cfg led_white 'white:status')
 	LED_RED=$(cfg led_red 'red:power')
@@ -180,6 +182,12 @@ load_cfg() {
 	fi
 	if [ "$WAN_DOWN_AFTER" -lt 0 ] 2>/dev/null; then
 		WAN_DOWN_AFTER=30
+	fi
+	if ! is_num "$WAN_PROBE_INTERVAL"; then
+		WAN_PROBE_INTERVAL=20
+	fi
+	if [ "$WAN_PROBE_INTERVAL" -lt 5 ] 2>/dev/null; then
+		WAN_PROBE_INTERVAL=5
 	fi
 	if ! is_num "$TM_RETRY"; then
 		TM_RETRY=120
@@ -287,6 +295,35 @@ wan_link_up() {
 }
 
 
+# The port probe is the expensive part of the WAN check: `swconfig dev
+# switch0 show` costs ~0.4 s on a 580 MHz CPU, every 10 s poll. The debounce
+# below is timestamp based, so a cached verdict for wan_probe_interval
+# seconds (default 20) decides exactly the same thing for half the cost.
+wan_link_probe() {
+	local dev=$1 now last verdict
+	now=$(date +%s)
+	last=$(sed -n '1p' "$WAN_PROBE_FILE" 2>/dev/null)
+	verdict=$(sed -n '2p' "$WAN_PROBE_FILE" 2>/dev/null)
+	if is_num "$last" && [ $((now - last)) -lt "$WAN_PROBE_INTERVAL" ]; then
+		if [ "$verdict" = up ]; then
+			return 0
+		fi
+		return 1
+	fi
+	if wan_link_up "$dev"; then
+		verdict=up
+	else
+		verdict=down
+	fi
+	if [ -d "$STATE_DIR" ]; then
+		printf '%s\n%s\n' "$now" "$verdict" > "$WAN_PROBE_FILE" 2>/dev/null
+	fi
+	if [ "$verdict" = up ]; then
+		return 0
+	fi
+	return 1
+}
+
 # True when the port under the WAN lost its link and stayed down for
 # wan_down_after seconds (debounces cable and port renegotiation). A WAN
 # that is leased but has no link is useless anyway, so the lease alone is
@@ -296,7 +333,7 @@ wan_link_down() {
 	[ "$WAN_DOWN_AFTER" -gt 0 ] 2>/dev/null || return 1
 	dev=$(uci -q get "network.$WAN_IF.device")
 	case "$dev" in ''|@*) dev=$(iface_l3dev "$WAN_IF") ;; esac
-	if wan_link_up "$dev"; then
+	if wan_link_probe "$dev"; then
 		# Only prune inside an existing state dir: rm -f on a missing
 		# path returns non-zero, and a failing command here would be
 		# this function's status.
@@ -863,12 +900,53 @@ antilag_section() {
 # Keep the antilag instance on the netdev that currently carries the uplink.
 # The section starts as ul_if=wan, which does not exist; updating it here is
 # also what follows a WAN DHCP device change or a switch to travelmate.
+# With no uplink at all there is no traffic to shape and no reflector that
+# can answer, so an antilag instance left attached to the dead device only
+# logs stall/recovery churn and burns through its reflector list. Pause it
+# while there is no uplink; the marker keeps the transition logged once.
+antilag_set_state() {
+	local want="$1" mark="$STATE_DIR/antilag_paused"
+
+	[ -x /etc/init.d/antilag ] || return 0
+	/etc/init.d/antilag enabled >/dev/null 2>&1 || return 0
+
+	if [ "$want" = 0 ]; then
+		# Stop it again if something brought it back (the iface hook, an
+		# operator, a leftover procd instance): the marker only gates the
+		# log line, not the state.
+		if /etc/init.d/antilag running >/dev/null 2>&1; then
+			/etc/init.d/antilag stop >/dev/null 2>&1
+			if [ ! -f "$mark" ]; then
+				: > "$mark"
+				log "antilag paused: no uplink"
+			fi
+		fi
+		return 0
+	fi
+
+	if [ ! -f "$mark" ]; then
+		return 0
+	fi
+	rm -f "$mark"
+	if ! /etc/init.d/antilag running >/dev/null 2>&1; then
+		/etc/init.d/antilag start >/dev/null 2>&1
+		log "antilag resumed: uplink back"
+	fi
+	return 0
+}
+
 antilag_update() {
 	local sec dev old_ul old_dl new_dl
 
 	[ -f /etc/config/antilag ] || return 0
 	sec=$(antilag_section)
 	[ -n "$sec" ] || return 0
+
+	# Wired WAN down and travelmate without a lease: nothing to shape.
+	if [ "$WAN" = 0 ] && [ "$TRM_LEASE" = 0 ]; then
+		antilag_set_state 0
+		return 0
+	fi
 
 	# The netdev the uplink really uses (l3_device first). A down wan
 	# reports no l3_device at all, so the configured device is the
@@ -889,6 +967,8 @@ antilag_update() {
 	if [ -z "$dev" ] || [ ! -e "/sys/class/net/$dev" ]; then
 		return 0
 	fi
+
+	antilag_set_state 1
 
 	old_ul=$(uci -q get "antilag.$sec.ul_if")
 	old_dl=$(uci -q get "antilag.$sec.dl_if")

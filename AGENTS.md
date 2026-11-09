@@ -58,9 +58,18 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   used as the state. It keeps the antilag
   instance on the netdev that currently carries the uplink (`ul_if` = WAN
   `l3_device`, or the travelmate STA when WAN is down; `dl_if` =
-  `ifb-<dev>`). One-shot service defaults on first boot (`defaults_version`
+  `ifb-<dev>`) and stops antilag entirely while there is no uplink at all
+  (a dead link only produces stall/reflector churn);
+  one-shot service defaults on first boot (`defaults_version`
   marker): antilag enabled on the WAN netdev, tailscale and tswatchdog
-  stopped and disabled when installed. Selected only on
+  stopped and disabled when installed. swconfig targets (mt7628) keep
+  `eth0.2` carrier up after the cable is pulled, so a WAN without a lease
+  is corroborated by reading the switch port behind its VLAN, debounced by
+  `wan_down_after` (30 s) and cached for `wan_probe_interval` (20 s: the
+  `swconfig` dump costs ~0.16 s on the TR1200). Exactly one daemon applies:
+  the lock is identified by argv, a burst of button/iface/phy events is
+  coalesced behind a pending flag, `wifi reload` is detached and
+  `ifstatus` is bounded by a timeout. Selected only on
   `pasankalla`/`pasankalla_lite` via `configs/pasankalla.config`.
 - Commit style: plain descriptive subject (see `git log`). The user controls
   pushes; commit locally, push only on request.
