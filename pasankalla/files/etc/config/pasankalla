@@ -33,16 +33,32 @@ config pasankalla 'settings'
 	# searching during and after this grace period.
 	option offline_after '60'
 
-	# Safety-net poll. Button/interface/wireless hotplug events apply the
-	# state immediately; this only catches missed events.
-	option poll_interval '30'
+	# Poll period. Button/interface/wireless hotplug events apply the state
+	# immediately, but swconfig targets (mt7628) never raise notification
+	# for a dead switch port, so the wired-WAN check below has to run on
+	# the poll. An apply forks uci/ifstatus/jsonfilter/swconfig a few dozen
+	# times (~2 s on the TR1200 when the router is otherwise busy), so the
+	# poll only starts a new apply once the previous one has finished.
+	option poll_interval '10'
+
+	# How long the WAN port may stay without carrier before the WAN counts
+	# as down even though netifd still reports a lease (swconfig keeps
+	# eth0.2 "up" after the cable is pulled). Debounces cable/port
+	# renegotiation. 0 disables the check.
+	option wan_down_after '30'
+
+	# How often to look for travelmate while it is the uplink and has no
+	# lease (seconds). Restarting it makes wpa_supplicant scan again; every
+	# restart flaps its STA, so this must stay well above one scan. 0 disables.
+	option travelmate_retry '120'
 
 	# sysfs LED names (both boards expose these labels from their DTS).
 	option led_white 'white:status'
 	option led_red 'red:power'
 
-	# Internal one-shot marker: zz-pasankalla sets this to 1 after enabling
-	# antilag and disabling tailscale. Do not set it by hand.
+	# Internal one-shot marker: zz-pasankalla sets this to 1 after pointing
+	# antilag at the WAN netdev and enabling it. Do not set it by hand.
+	# (Tailscale used to be disabled here too; it is no longer touched.)
 	option defaults_version '0'
 
 	# Managed by zz-pasankalla: wifi-iface section names that belong to the

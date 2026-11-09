@@ -18,7 +18,8 @@
 # travelmate init being disabled never makes the next poll re-enable it.
 #
 # Event sources: /etc/hotplug.d/button, /etc/hotplug.d/iface,
-# /etc/hotplug.d/ieee80211, plus a 30 s poll from the procd daemon. All
+# /etc/hotplug.d/ieee80211, plus a poll (poll_interval, 3 s by default) from
+# the procd daemon. All
 # applies are serialized with flock. LED blinking is done by the kernel LED
 # timer trigger, not by this script.
 
@@ -26,10 +27,19 @@ CONFIG=pasankalla
 STATE_DIR=/tmp/pasankalla
 SLIDER_FILE="$STATE_DIR/slider"
 OFFLINE_FILE="$STATE_DIR/offline_since"
+WAN_LINK_FILE="$STATE_DIR/wan_link_down"
 SIG_FILE="$STATE_DIR/sig"
 DETECT_FILE="$STATE_DIR/detect"
 TM_FILE="$STATE_DIR/tm"
-LOCK_FILE="$STATE_DIR/lock"
+DAEMON_PID="$STATE_DIR/daemon.pid"
+TM_RETRY_FILE="$STATE_DIR/tm_retry"
+PENDING_FILE="$STATE_DIR/pending"
+RG_LOCK="$STATE_DIR/run.lock"
+# Our own argv[0] + action ("/usr/sbin/pasankalla apply", "/usr/sbin/pasankalla
+# daemon"), matched against /proc/<pid>/cmdline. The daemon's lock owner is its
+# own pid, so the match cannot be a fixed string.
+SCRIPT_ARGV="$0 $1 "
+
 WAN_IF=wan
 WAN6_IF=wan6
 TRM_IF=trm_wwan
@@ -47,6 +57,91 @@ is_num() {
 	esac
 }
 
+# ubus reply with a wall-clock deadline. A plain ifstatus blocks for as long
+# as netifd takes, and netifd blocks on the interface's own setup scripts:
+# a DHCP-less wan (no cable) renews wan and wan6 forever on the TR1200 and
+# an unbounded ifstatus hung an apply for over ten minutes. busybox has no
+# timeout(1), so the caller polls for the reply file.
+ubus_status() {
+	ubus -t 5 call "network.interface.$1" status
+}
+
+ifstatus() {
+	local f
+	f="/tmp/pasankalla.status.$1.$$"
+	rm -f "$f"
+	( ubus_status "$1" > "$f" 2>/dev/null ) &
+	ubus_pid=$!
+	ubus_n=0
+	while kill -0 "$ubus_pid" 2>/dev/null; do
+		ubus_n=$((ubus_n + 1))
+		if [ "$ubus_n" -ge "$IFSTATUS_TIMEOUT" ]; then
+			# The subshell wraps ubus, so -TERM on it is what ubus gets.
+			kill -TERM "$ubus_pid" 2>/dev/null
+			rm -f "$f"
+			return 1
+		fi
+		sleep 1
+	done
+	cat "$f" 2>/dev/null
+	rm -f "$f"
+}
+
+# Serialize the applies: the daemon poll and every hotplug/menu action fork
+# this script, and each apply rewrites UCI configs (uci replaces the file),
+# so two at once can drop one of the writes. A plain mkdir is atomic, needs
+# no coreutils and leaves nothing behind once the holder releases it; a
+# holder that died is recognised by its pid being gone or by the lock being
+# older than RG_LOCK_MAX seconds.
+RG_LOCK_MAX=120
+# ubus answers within -t on its own; the poll only guards against a child
+# that never returns (ubusd restarting, a stuck netifd). One second is way
+# above the real reply time (milliseconds) and keeps a dead ubusd from
+# stretching one apply into minutes - an apply with the lock taken is what
+# every other hook waits behind.
+IFSTATUS_TIMEOUT=1
+IFSTATUS_TICKS=1
+
+
+is_pasankalla_pid() {
+	local c
+	c=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null)
+	# procd runs the script as "/bin/sh /usr/sbin/pasankalla daemon ",
+	# so the argv we match on is a substring of the cmdline, never the
+	# whole of it.
+	case "$c" in
+	*"$SCRIPT_ARGV"*) return 0 ;;
+	esac
+	return 1
+}
+
+run_lock() {
+	local now age pid
+	now=$(date +%s)
+	if mkdir "$RG_LOCK" 2>/dev/null; then
+		echo "$$ $now" > "$RG_LOCK/owner" 2>/dev/null
+		return 0
+	fi
+	read -r pid age < "$RG_LOCK/owner" 2>/dev/null
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && is_pasankalla_pid "$pid"; then
+		return 1
+	fi
+	if is_num "$now" && is_num "$age" && [ $((now - age)) -lt "$RG_LOCK_MAX" ] &&
+	   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		return 1
+	fi
+	# Holder is gone (killed, or the script was replaced under it).
+	rm -rf "$RG_LOCK" 2>/dev/null
+	if mkdir "$RG_LOCK" 2>/dev/null; then
+		echo "$$ $now" > "$RG_LOCK/owner" 2>/dev/null
+		return 0
+	fi
+	return 1
+}
+
+run_unlock() {
+	rm -rf "$RG_LOCK" 2>/dev/null
+}
 cfg() {
 	local v
 	v=$(uci -q get "$CONFIG.settings.$1")
@@ -63,17 +158,35 @@ load_cfg() {
 	GUEST_NET=$(cfg guest_network 'lanclientes')
 	GUEST_5G_FOLLOW=$(cfg guest_5g_follow_uplink 1)
 	SLIDER_INVERT=$(cfg slider_invert 0)
-	WAN_GRACE=$(cfg wan_grace 20)
+	WAN_GRACE=${WAN_GRACE:=$(cfg wan_grace 20)}
 	OFFLINE_AFTER=$(cfg offline_after 60)
-	POLL_INTERVAL=$(cfg poll_interval 30)
+	POLL_INTERVAL=$(cfg poll_interval 10)
+	WAN_DOWN_AFTER=$(cfg wan_down_after 30)
+	TM_RETRY=$(cfg travelmate_retry 120)
 	LED_WHITE=$(cfg led_white 'white:status')
 	LED_RED=$(cfg led_red 'red:power')
 
 	is_num "$WAN_GRACE" || WAN_GRACE=20
 	is_num "$OFFLINE_AFTER" || OFFLINE_AFTER=60
-	is_num "$POLL_INTERVAL" || POLL_INTERVAL=30
-	[ "$OFFLINE_AFTER" -ge 0 ] 2>/dev/null || OFFLINE_AFTER=60
-	[ "$POLL_INTERVAL" -ge 5 ] 2>/dev/null || POLL_INTERVAL=30
+	is_num "$POLL_INTERVAL" || POLL_INTERVAL=3
+	if ! [ "$OFFLINE_AFTER" -ge 0 ] 2>/dev/null; then
+		OFFLINE_AFTER=60
+	fi
+	if ! [ "$POLL_INTERVAL" -ge 3 ] 2>/dev/null; then
+		POLL_INTERVAL=3
+	fi
+	if ! is_num "$WAN_DOWN_AFTER"; then
+		WAN_DOWN_AFTER=30
+	fi
+	if [ "$WAN_DOWN_AFTER" -lt 0 ] 2>/dev/null; then
+		WAN_DOWN_AFTER=30
+	fi
+	if ! is_num "$TM_RETRY"; then
+		TM_RETRY=120
+	fi
+	if ! is_num "$IFSTATUS_TIMEOUT"; then
+		IFSTATUS_TIMEOUT=4
+	fi
 }
 
 iface_v4() {
@@ -96,8 +209,155 @@ iface_v6() {
 	return 1
 }
 
+# Sysfs carrier of a kernel netdev: fail = no carrier, 1 = up or unknown.
+dev_carrier_up() {
+	local c
+	[ -n "$1" ] || return 0
+	if [ -r "/sys/class/net/$1/carrier" ]; then
+		read -r c < "/sys/class/net/$1/carrier" 2>/dev/null
+		if [ "$c" = 0 ]; then
+			return 1
+		fi
+	elif [ -r "/sys/class/net/$1/operstate" ]; then
+		read -r c < "/sys/class/net/$1/operstate" 2>/dev/null
+		if [ "$c" = down ]; then
+			return 1
+		fi
+	fi
+	return 0
+}
+
+# Port of the physical switch that carries a VLAN netdev like eth0.2, taken
+# from network.switch_vlan.<name>.ports (port listed as "1t" or "1").
+switch_port_of() {
+	local vd v p vlan
+	vlan=$1
+	for vd in $(uci -q show network | sed -n 's/^network\.\([^.=]*\)=switch_vlan$/\1/p'); do
+		[ "$(uci -q get "network.$vd.vlan")" = "$vlan" ] || continue
+		for v in $(uci -q get "network.$vd.ports"); do
+			case "$v" in
+			*[!0-9t]*) continue ;;
+			esac
+			v=${v%t}
+			# Skip the CPU port (an 8, 6t, ... port also listed on the
+			# other VLANs); it is the one that stays up after unplug.
+			for p in $(uci -q get "network.$(uci -q get "network.$vd.device").ports"); do
+				case " $p " in
+				*" ${v}t "*) continue 2 ;;
+				esac
+			done
+			is_num "$v" && { echo "$v"; return 0; }
+		done
+	done
+	return 1
+}
+
+# Link of one swconfig switch port: 0 = up, 1 = down, 2 = unknown.
+swconfig_port_up() {
+	local sw=$1 port=$2 rest
+	# The line looks like "link: port:1 link:down" or
+	# "link: port:0 link:up speed:100baseT". sed prints the first matching
+	# line and quits, so this costs one process instead of an awk
+	# interpreter on a 580 MHz CPU.
+	rest=$(swconfig dev "$sw" show 2>/dev/null |
+		sed -n "/link: port:$port /{s/.* link:\([a-z][a-z]*\).*/link:\1/p;q;}")
+	case "$rest" in
+	link:up) return 0 ;;
+	link:down) return 1 ;;
+	esac
+	return 2
+}
+
+# Is the link of the device that carries the WAN up?
+wan_link_up() {
+	local dev=$1 vlan port sw
+	case "$dev" in
+	'') dev_carrier_up ""; return ;;
+	*.*) vlan=${dev##*.} ;;
+	*) dev_carrier_up "$dev"; return ;;
+	esac
+	port=$(switch_port_of "$vlan") || { dev_carrier_up "$dev"; return; }
+	sw=$(uci -q get network.@switch[0].name)
+	[ -n "$sw" ] || sw=switch0
+	swconfig_port_up "$sw" "$port"
+	case $? in
+	0|2) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+
+# True when the port under the WAN lost its link and stayed down for
+# wan_down_after seconds (debounces cable and port renegotiation). A WAN
+# that is leased but has no link is useless anyway, so the lease alone is
+# not enough on swconfig hardware.
+wan_link_down() {
+	local dev now since
+	[ "$WAN_DOWN_AFTER" -gt 0 ] 2>/dev/null || return 1
+	dev=$(uci -q get "network.$WAN_IF.device")
+	case "$dev" in ''|@*) dev=$(iface_l3dev "$WAN_IF") ;; esac
+	if wan_link_up "$dev"; then
+		# Only prune inside an existing state dir: rm -f on a missing
+		# path returns non-zero, and a failing command here would be
+		# this function's status.
+		if [ -d "$STATE_DIR" ]; then
+			rm -f "$WAN_LINK_FILE" "$WAN_LINK_FILE.done" "$WAN_LINK_FILE.lease"
+		fi
+		return 1
+	fi
+	now=$(date +%s)
+	since=$(cat "$WAN_LINK_FILE" 2>/dev/null)
+	if ! is_num "$since"; then
+		echo "$now" > "$WAN_LINK_FILE" 2>/dev/null
+		# do_execve failures are reported one call late in this shell
+		# (ash strips \$- only on the next exec); make sure returning
+		# here can never leave a failing exec as the last status.
+		log "wan link down detected on ${dev:-none}"
+		return 1
+	fi
+	[ $((now - since)) -ge "$WAN_DOWN_AFTER" ] || return 1
+	# A dead swconfig port keeps its stale lease, and its netdev counters
+	# only move when netifd retries the DHCP renew on eth0.2 itself. Two
+	# applies after the debounce are the evidence that it is really gone.
+	if [ "$(cat "$WAN_LINK_FILE.lease" 2>/dev/null)" != "$since" ]; then
+		echo "$since" > "$WAN_LINK_FILE.lease" 2>/dev/null
+		log "wan port down on ${dev:-none}, waiting for the lease"
+		return 1
+	fi
+	# From here the link has been down for the whole debounce: the WAN is
+	# not usable, whatever lease netifd still reports. The announce is last
+	# and returns explicitly: an unmatched [ ] test (or its negation) would
+	# otherwise decide this function's status.
+	if [ "$(cat "$WAN_LINK_FILE.done" 2>/dev/null)" != "$since" ]; then
+		log "wan link down on ${dev:-none} for $((now - since))s"
+		echo "$since" > "$WAN_LINK_FILE.done" 2>/dev/null
+	fi
+	return 0
+}
+
+# The WAN has no usable uplink: the switch port lost its link (swconfig),
+# netifd says down (DSA) or there is no lease. The link comes first: after
+# a swconfig unplug netifd keeps the stale lease and up=true for minutes.
 wan_ok() {
-	iface_v4 "$WAN_IF" || iface_v6 "$WAN6_IF"
+	local up
+	# Cheap path first: a healthy interface costs one ifstatus and skips
+	# the swconfig probe entirely (that one is ~0.4 s on a 580 MHz CPU).
+	up=$(ifstatus "$WAN_IF" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
+	if [ "$up" != false ]; then
+		if iface_v4 "$WAN_IF" || iface_v6 "$WAN6_IF"; then
+			if [ -d "$STATE_DIR" ]; then
+				rm -f "$WAN_LINK_FILE" "$WAN_LINK_FILE.done" \
+					"$WAN_LINK_FILE.lease" 2>/dev/null
+			fi
+			return 0
+		fi
+	fi
+	# Down, or up without a lease: only now is the physical link worth
+	# probing, and it is what starts/advances the debounce.
+	if wan_link_down; then
+		return 1
+	fi
+	return 1
 }
 
 trm_ok() {
@@ -112,11 +372,18 @@ iface_l3dev() {
 	d=$(ifstatus "$1" 2>/dev/null | jsonfilter -e '@["l3_device"]' 2>/dev/null)
 	case "$d" in
 	''|null)
+		# Fallback: the configured device has to exist as a kernel
+		# netdev, otherwise antilag would be pointed at nothing. An
+		# interface that is down reports no l3_device at all, so this
+		# is what points antilag at eth0.2 before the first lease.
 		d=$(uci -q get "network.$1.device")
+		# Only a plain netdev name: @device references and empty
+		# values are not something antilag can attach to.
+		case "$d" in
+		''|null|@*) return 1 ;;
+		esac
+		[ -e "/sys/class/net/$d" ] || return 1
 		;;
-	esac
-	case "$d" in
-	''|null|@*) return 1 ;;
 	esac
 	echo "$d"
 }
@@ -196,14 +463,19 @@ find_builtin_5g() {
 		case "$rp" in
 		*usb*) continue ;;
 		esac
-		[ "$(radio_band "$r")" = 5g ] && { echo "$r"; return 0; }
+		if [ "$(radio_band "$r")" = 5g ]; then
+			echo "$r"
+			return 0
+		fi
 	done
 	return 1
 }
 
 set_radio_disabled() {
 	[ -n "$1" ] || return 0
-	[ "$(uci -q get "wireless.$1.disabled")" = "$2" ] && return 0
+	if [ "$(uci -q get "wireless.$1.disabled")" = "$2" ]; then
+		return 0
+	fi
 	uci -q set "wireless.$1.disabled=$2"
 	WIRELESS_CHANGED=1
 }
@@ -273,6 +545,64 @@ guest_sections() {
 # original "disabled" value is stored on the same wifi-iface section, so the
 # suspend/resume transition is one atomic wireless commit and survives a
 # reboot with travelmate still active.
+#
+# fw4 compiles the WAN zone iifname set from the state of its member
+# packages: an interface that is down (trm_wwan right after boot, and again
+# every time travelmate flaps it) shows up as its device, and a device-less
+# one drops out entirely - forwarded travelmate traffic then hits the FORWARD
+# policy (drop) with error_missing_interface, the silent "no internet" after
+# a WAN drop. The iface hotplug covers up/down; this reload keeps the zone in
+# step when the interface list itself changes, once per change, not per poll.
+FW_SIG_FILE="$STATE_DIR/fw_zone"
+WAN_ZONE_SIG=""
+
+fw_zone_sig() {
+	for z in $(uci -q show firewall 2>/dev/null | sed -n 's/^firewall\.\([^.=]*\)=zone$/\1/p'); do
+		case " $(uci -q get "firewall.$z.network") " in
+		*" $WAN_IF "*|*" $WAN6_IF "*|*" $TRM_IF "*|*" $TRM6_IF "*)
+			echo "$z $(uci -q get "firewall.$z.network")"
+			;;
+		esac
+	done
+}
+
+sync_wan_zone() {
+	local sig seen
+	sig=$(fw_zone_sig)
+	[ -n "$sig" ] || return 0
+	seen=$(cat "$FW_SIG_FILE" 2>/dev/null)
+	if [ "$seen" = "$sig" ]; then
+		return 0
+	fi
+	echo "$sig" > "$FW_SIG_FILE" 2>/dev/null
+	ubus -t 5 call network reload >/dev/null 2>&1
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	log "wan zone reloaded: $sig"
+}
+
+ensure_trm_if() {
+	if uci -q get "network.$TRM_IF.device" >/dev/null 2>&1; then
+		return 0
+	fi
+	if [ "$(uci -q get "network.$TRM_IF")" != interface ]; then
+		return 0
+	fi
+	# DSA images (TR3000) create trm_wwan on demand via hotplug, so there is
+	# no empty bridge to stand in; only swconfig (TR1200) needs a device.
+	if [ ! -x /sbin/swconfig ] || [ ! -f /etc/config/network ]; then
+		return 0
+	fi
+	for d in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p'); do
+		[ "$(uci -q get "network.$d.type")" = bridge ] || continue
+		uci -q set "network.$TRM_IF.device=$(uci -q get "network.$d.name")"
+		if uci -q commit network; then
+			log "attach $TRM_IF to $(uci -q get "network.$d.name") for the wan zone"
+		fi
+		return 0
+	done
+	return 0
+}
+
 suspend_aps() {
 	local r="$1" s cur
 	[ -n "$r" ] || return 0
@@ -286,7 +616,9 @@ suspend_aps() {
 		*" $s "*) continue ;;
 		esac
 		cur=$(uci -q get "wireless.$s.disabled")
-		[ "$cur" = 1 ] && continue
+		if [ "$cur" = 1 ]; then
+			continue
+		fi
 		[ -n "$cur" ] || cur=0
 		uci -q set "wireless.$s.pasankalla_suspended=1"
 		uci -q set "wireless.$s.pasankalla_orig_disabled=$cur"
@@ -303,7 +635,9 @@ resume_aps() {
 		esac
 		[ "$(uci -q get "wireless.$s.pasankalla_suspended")" = 1 ] || continue
 		dev=$(uci -q get "wireless.$s.device")
-		[ -n "$keep" ] && [ "$dev" = "$keep" ] && continue
+		if [ -n "$keep" ] && [ "$dev" = "$keep" ]; then
+			continue
+		fi
 		orig=$(uci -q get "wireless.$s.pasankalla_orig_disabled")
 		case "$orig" in
 		0|1) ;;
@@ -327,11 +661,15 @@ slider_on() {
 	fi
 	case "$v" in
 	1)
-		[ "$SLIDER_INVERT" = 1 ] && return 1
+		if [ "$SLIDER_INVERT" = 1 ]; then
+			return 1
+		fi
 		return 0
 		;;
 	0)
-		[ "$SLIDER_INVERT" = 1 ] && return 0
+		if [ "$SLIDER_INVERT" = 1 ]; then
+			return 0
+		fi
 		return 1
 		;;
 	esac
@@ -371,7 +709,10 @@ offline_expired() {
 }
 
 tm_running() {
-	[ -x /etc/init.d/travelmate ] && /etc/init.d/travelmate running >/dev/null 2>&1
+	if [ ! -x /etc/init.d/travelmate ]; then
+		return 1
+	fi
+	/etc/init.d/travelmate running >/dev/null 2>&1
 }
 
 # trm_wwan is probed by route/lookup for its default route, so a travelmate STA
@@ -396,7 +737,9 @@ tm_setif() {
 		fi
 		list="$list $s"
 	done
-	[ "$(uci -q get "wireless.$ifc.network")" = "${list# }" ] && return 1
+	if [ "$(uci -q get "wireless.$ifc.network")" = "${list# }" ]; then
+		return 1
+	fi
 	uci -q set "wireless.$ifc.network=${list# }"
 	WIRELESS_CHANGED=1
 	log "travelmate uplink \"$dev\" $2 ($TRM_IF)"
@@ -475,12 +818,32 @@ tm_start() {
 	TM_DOWN=0
 	tm_ledger set 1
 	[ -n "$was" ] || was=0
+	# A travelmate that keeps "running" with no lease is stuck (every
+	# uplink candidate exhausted, or the saved profile is on another
+	# band). Restarting makes wpa_supplicant scan again; rate-limited,
+	# because each restart flaps its STA.
+	stale=0
+	if [ "$TM_RETRY" -gt 0 ] 2>/dev/null && tm_running && [ "$TRM_LEASE" != 1 ]; then
+		now=$(date +%s)
+		last=$(cat "$TM_RETRY_FILE" 2>/dev/null)
+		if ! is_num "$last"; then
+			echo "$now" > "$TM_RETRY_FILE" 2>/dev/null
+		elif [ $((now - last)) -ge "$TM_RETRY" ]; then
+			stale=1
+		fi
+	fi
 	if [ "$was" != 1 ] && ! tm_running; then
 		log "travelmate start radio=${TRM_RADIO:-none}"
 		/etc/init.d/travelmate start >/dev/null 2>&1
+		echo "$(date +%s)" > "$TM_RETRY_FILE" 2>/dev/null
+	elif [ "$stale" = 1 ]; then
+		log "travelmate restart radio=${TRM_RADIO:-none} (no lease yet)"
+		/etc/init.d/travelmate restart >/dev/null 2>&1
+		echo "$(date +%s)" > "$TM_RETRY_FILE" 2>/dev/null
 	elif [ "$RADIO_CHANGED" = 1 ] && tm_running; then
 		log "travelmate restart radio=${TRM_RADIO:-none}"
 		/etc/init.d/travelmate restart >/dev/null 2>&1
+		echo "$(date +%s)" > "$TM_RETRY_FILE" 2>/dev/null
 	fi
 	return 0
 }
@@ -488,10 +851,10 @@ tm_start() {
 antilag_section() {
 	local s
 	for s in wan primary; do
-		[ "$(uci -q get "antilag.$s")" = antilag ] && {
+		if [ "$(uci -q get "antilag.$s")" = antilag ]; then
 			echo "$s"
 			return 0
-		}
+		fi
 	done
 	uci -q show antilag 2>/dev/null |
 		sed -n 's/^antilag\.\([^.=]*\)=antilag$/\1/p' | head -n1
@@ -507,15 +870,32 @@ antilag_update() {
 	sec=$(antilag_section)
 	[ -n "$sec" ] || return 0
 
+	# The netdev the uplink really uses (l3_device first). A down wan
+	# reports no l3_device at all, so the configured device is the
+	# fallback - that is the case right after boot and right after an
+	# unplug, when antilag must still follow the wired uplink.
 	dev=""
-	[ "$WAN" = 1 ] && dev=$(iface_l3dev "$WAN_IF")
-	[ -z "$dev" ] && [ "$TRM_LEASE" = 1 ] && dev=$(iface_l3dev "$TRM_IF")
-	[ -n "$dev" ] || return 0
+	if [ "$WAN" = 1 ]; then
+		dev=$(iface_l3dev "$WAN_IF")
+	fi
+	if [ -z "$dev" ] && [ "$TRM_LEASE" = 1 ]; then
+		dev=$(iface_l3dev "$TRM_IF")
+	fi
+	if [ -z "$dev" ]; then
+		dev=$(iface_l3dev "$WAN_IF")
+	fi
+	# Never point antilag at a netdev that is gone: it would fail its tc
+	# setup and log on every restart. Keeping the last value is better.
+	if [ -z "$dev" ] || [ ! -e "/sys/class/net/$dev" ]; then
+		return 0
+	fi
 
 	old_ul=$(uci -q get "antilag.$sec.ul_if")
 	old_dl=$(uci -q get "antilag.$sec.dl_if")
 	new_dl="ifb-$dev"
-	[ "$old_ul" = "$dev" ] && [ "$old_dl" = "$new_dl" ] && return 0
+	if [ "$old_ul" = "$dev" ] && [ "$old_dl" = "$new_dl" ]; then
+		return 0
+	fi
 
 	uci -q set "antilag.$sec.ul_if=$dev"
 	uci -q set "antilag.$sec.dl_if=$new_dl"
@@ -524,15 +904,24 @@ antilag_update() {
 		return 1
 	fi
 	log "antilag $sec uplink ${old_ul:-none} -> $dev"
-	if [ -x /etc/init.d/antilag ] && /etc/init.d/antilag enabled >/dev/null 2>&1; then
+	# Only restart when antilag is actually running: restarting an instance
+	# whose uplink netdev is missing (the link just died) only adds a failed
+	# setup on top of the transition that is still settling.
+	if [ -x /etc/init.d/antilag ] && /etc/init.d/antilag enabled >/dev/null 2>&1 &&
+	   /etc/init.d/antilag running >/dev/null 2>&1; then
 		/etc/init.d/antilag restart >/dev/null 2>&1
 	fi
 	return 0
 }
 
+# netifd can take minutes to set up the radios while the WAN profile is
+# stuck (a DHCP-less wan renews forever), and /sbin/wifi waits for netifd.
+# Running the reload inside the apply would hold the lock - and with it every
+# button, iface and ieee80211 hook - for that whole time. Detached, the
+# reload lands on whatever the next applies leave in the config.
 wifi_reload() {
 	log "wifi reload"
-	/sbin/wifi reload >/dev/null 2>&1
+	/sbin/wifi reload >/dev/null 2>&1 &
 }
 
 # LED state left by the last apply. Rewriting trigger and brightness on
@@ -608,7 +997,9 @@ apply_leds() {
 detect_log() {
 	local sig
 	sig="$WAN|$WAN_WAIT|$USB_PRESENT|$USB_ACTIVE|$TRM_LEASE|$SLIDER|$TRM_RADIO|$WANT_TRM"
-	[ "$(cat "$DETECT_FILE" 2>/dev/null)" = "$sig" ] && return 0
+	if [ "$(cat "$DETECT_FILE" 2>/dev/null)" = "$sig" ]; then
+		return 0
+	fi
 	log "detect wan=$WAN wan_wait=$WAN_WAIT usb_present=$USB_PRESENT usb_active=$USB_ACTIVE trm_lease=$TRM_LEASE slider=$SLIDER radio=${TRM_RADIO:-none} want_trm=$WANT_TRM"
 	echo "$sig" > "$DETECT_FILE" 2>/dev/null
 }
@@ -627,6 +1018,10 @@ state_log() {
 apply() {
 	load_cfg
 	mkdir -p "$STATE_DIR" 2>/dev/null
+	# An apply killed mid-flight (procd SIGKILL, OOM) leaves its ubus reply
+	# files behind; nothing else in /tmp matches this prefix.
+	rm -f /tmp/pasankalla.status.* 2>/dev/null
+	ensure_trm_if
 
 	WIRELESS_CHANGED=0
 	TRAVELMATE_CHANGED=0
@@ -637,6 +1032,7 @@ apply() {
 	TRM_RADIO=""
 	GUEST_LIST=""
 	TM_DOWN=0
+	USB_PRESENT=0
 
 	if [ "$ENABLED" != 1 ]; then
 		tm_stop
@@ -663,9 +1059,14 @@ apply() {
 
 	USB_PATHS=$(usb_phy_paths)
 	USB_PRESENT=0
-	[ -n "$USB_PATHS" ] && USB_PRESENT=1
+	if [ -n "$USB_PATHS" ]; then
+		USB_PRESENT=1
+	fi
 	wan_ok && WAN=1
 	trm_ok && TRM_LEASE=1
+	if [ "$TRM_LEASE" = 1 ]; then
+		rm -f "$TM_RETRY_FILE" 2>/dev/null
+	fi
 
 	USB_RADIO=""
 	if [ "$USB_PRESENT" = 1 ]; then
@@ -675,6 +1076,14 @@ apply() {
 	if [ -z "$TRM_RADIO" ]; then
 		TRM_RADIO=$(find_builtin_5g)
 	fi
+	# A dead WAN link outranks whatever wan_ok saw: the debounced port check
+	# is the only thing that notices an unplugged swconfig WAN, and it only
+	# returns true on a later poll than the one that started the timer.
+	WAN_LINK_DOWN=0
+	if wan_link_down; then
+		WAN_LINK_DOWN=1
+		WAN=0
+	fi
 
 	# While the router just booted, give the ethernet WAN a chance to lease
 	# before starting a 5 GHz scan. A hotplug iface event re-applies as soon
@@ -683,25 +1092,49 @@ apply() {
 	if [ "$WAN" = 0 ] && [ -n "$TRM_RADIO" ] && boot_grace; then
 		WAN_WAIT=1
 	fi
+	# travelmate is needed whenever the WAN has no usable link. Whether a
+	# travelmate radio exists only decides which one is used: without one
+	# (no built-in 5 GHz, no stick) WANT_TRM=0, and the resolve below falls
+	# back to plain offline - unless the last travelled profile is still
+	# loaded, in which case travelmate keeps serving from it (the
+	# "not configured" case that used to be logged forever).
 	WANT_TRM=0
-	if [ "$WAN" = 0 ] && [ -n "$TRM_RADIO" ] && [ "$WAN_WAIT" = 0 ]; then
+	if [ "$WAN" = 0 ] && [ "$WAN_WAIT" = 0 ]; then
 		WANT_TRM=1
 	fi
-	[ "$WANT_TRM" = 1 ] && [ -n "$USB_RADIO" ] && USB_ACTIVE=1
-	slider_on && SLIDER=1
+	# The USB radio is only "active" once it really carries the uplink, i.e.
+	# travelmate is wanted and this poll selected it. Never fold that into
+	# one && list: with WAN up the last test fails and the whole list turns
+	# into a non-zero status.
+	USB_ACTIVE=0
+	if [ "$WANT_TRM" = 1 ] && [ -n "$USB_RADIO" ]; then
+		USB_ACTIVE=1
+	fi
+	SLIDER=0
+	if slider_on; then
+		SLIDER=1
+	fi
 	GUEST_LIST=$(guest_sections)
 
 	detect_log
 	antilag_update
+	set_trm_radio "$TRM_RADIO" || true
 
 	OLD_TRM_RADIO=$(uci -q get travelmate.global.trm_radio)
 	RADIO_CHANGED=0
 	# Only compare/announce the travelmate radio while travelmate is wanted.
 	# With WAN up TRM_RADIO is just a hint and is never written below, so
 	# comparing it every poll logged the same transition forever.
-	if [ "$WANT_TRM" = 1 ] && [ "$OLD_TRM_RADIO" != "$TRM_RADIO" ]; then
+	if [ "$WANT_TRM" = 1 ] && [ -n "$TRM_RADIO" ] &&
+	   [ "$OLD_TRM_RADIO" != "$TRM_RADIO" ]; then
 		RADIO_CHANGED=1
-		log "radio ${OLD_TRM_RADIO:-none} -> ${TRM_RADIO:-none}"
+		log "radio ${OLD_TRM_RADIO:-none} -> $TRM_RADIO"
+	fi
+	# Without any radio section there is nothing to travel on. Keep
+	# travelmate running if it already owns the uplink (a loaded profile
+	# with a connected STA); otherwise a WAN-less router is just offline.
+	if [ "$WANT_TRM" = 1 ] && [ -z "$TRM_RADIO" ]; then
+		trm_ok || WANT_TRM=0
 	fi
 	# A radio switch (USB plugged/unplugged) gets a fresh grace period, so
 	# the LED shows the new fast/slow blink before falling back to red.
@@ -740,7 +1173,11 @@ apply() {
 		*usb*) ;;
 		*) continue ;;
 		esac
-		[ "$WANT_TRM" = 1 ] && [ "$r" = "$TRM_RADIO" ] && continue
+		# A test that ends a && list can be the last command of this
+		# loop body, and one false case would then end apply early.
+		if [ "$WANT_TRM" = 1 ] && [ "$r" = "$TRM_RADIO" ]; then
+			continue
+		fi
 		set_radio_disabled "$r" 1
 	done
 
@@ -757,7 +1194,9 @@ apply() {
 	for s in $GUEST_LIST; do
 		[ "$(uci -q get "wireless.$s")" = wifi-iface ] || continue
 		desired=1
-		[ "$SLIDER" = 1 ] && desired=0
+		if [ "$SLIDER" = 1 ]; then
+			desired=0
+		fi
 		if [ "$desired" = 0 ] && [ "$GUEST_5G_FOLLOW" = 1 ] &&
 		   [ "$WANT_TRM" = 1 ] && [ -n "$TRM_RADIO" ]; then
 			dev=$(uci -q get "wireless.$s.device")
@@ -769,7 +1208,9 @@ apply() {
 		if [ "$desired" = 0 ] && [ -n "$dev" ]; then
 			set_radio_disabled "$dev" 0
 		fi
-		[ "$(uci -q get "wireless.$s.disabled")" = "$desired" ] && continue
+		if [ "$(uci -q get "wireless.$s.disabled")" = "$desired" ]; then
+			continue
+		fi
 		log "guest $s disabled=$desired"
 		uci -q set "wireless.$s.disabled=$desired"
 		WIRELESS_CHANGED=1
@@ -794,48 +1235,86 @@ apply() {
 	if [ "$WAN" = 1 ]; then
 		state=wan
 		rm -f "$OFFLINE_FILE"
+	elif [ "$TRM_LEASE" = 1 ] && [ "$WANT_TRM" = 1 ]; then
+		# A travelmate lease is the verdict on where the uplink is, not
+		# the age of the office: a working Wi-Fi uplink must never fade
+		# into "offline" because the WAN drop has been offline_after long.
+		state=wifi
+		if [ "$USB_ACTIVE" = 1 ]; then
+			state=usb
+		fi
+		rm -f "$OFFLINE_FILE"
 	elif [ "$WAN_WAIT" = 1 ]; then
 		# WAN may still lease; show the travelmate "searching" blink rather
 		# than claiming the router is offline.
 		state=wifi
+		rm -f "$OFFLINE_FILE"
 	elif [ "$WANT_TRM" = 0 ]; then
 		state=offline
 		rm -f "$OFFLINE_FILE"
-	elif [ "$TRM_LEASE" = 1 ]; then
-		state=wifi
-		[ "$USB_ACTIVE" = 1 ] && state=usb
-		rm -f "$OFFLINE_FILE"
 	else
+		# Travelmate is up and looking for Wi-Fi, with no lease yet:
+		# the fallback LED is honest about it, so red is only for a
+		# router that has really been without any uplink.
 		if offline_expired; then
 			state=offline
 		else
 			state=wifi
-			[ "$USB_ACTIVE" = 1 ] && state=usb
+			if [ "$USB_ACTIVE" = 1 ]; then
+				state=usb
+			fi
 		fi
 	fi
 
+	sync_wan_zone
 	apply_leds "$state"
 	state_log "$state"
 	return 0
 }
 
 apply_locked() {
-	(
-		# busybox flock has no -w timeout; a blocking lock is what we want
-		# here because the critical section is short (uci + wifi reload).
-		flock -x 9 || {
-			log "apply lock failed"
-			exit 0
-		}
-		apply
-	) 9>"$LOCK_FILE"
+	# Never wait for an apply that is already running: the next poll is
+	# seconds away and every hotplug fires its own. Overlapping applies
+	# were what left the configs half-written. A hotplug that finds the
+	# lock taken leaves the marker behind, so the poll that holds it runs
+	# apply again right after and the burst of events (a WAN drop raises
+	# iface, ieee80211 and button hookups at once) becomes one apply.
+	if run_lock; then
+		rm -f "$PENDING_FILE" 2>/dev/null
+		trap 'run_unlock' EXIT INT TERM HUP
+		while :; do
+			apply
+			if [ ! -f "$PENDING_FILE" ]; then
+				break
+			fi
+			rm -f "$PENDING_FILE" 2>/dev/null
+		done
+		run_unlock
+		trap - EXIT INT TERM HUP
+	else
+		: > "$PENDING_FILE" 2>/dev/null
+	fi
+	# A hotplug event or the poll must never take the daemon down with
+	# procd, which restarts a service whose script fails.
+	return 0
 }
 
 daemon() {
-	load_cfg
+	local t start
 	while :; do
+		# Re-read the config every poll: pasankalla reload expects it.
+		load_cfg
+		start=$(date +%s)
 		apply_locked
-		sleep "$POLL_INTERVAL"
+		# Sleep until the next tick rather than for a fixed interval: a slow
+		# apply (a DHCP-less wan makes netifd answer slowly) is not followed
+		# by a full extra sleep, which would double the detection latency.
+		t=$(date +%s)
+		t=$((start + POLL_INTERVAL - t))
+		if [ "$t" -lt 1 ]; then
+			t=1
+		fi
+		sleep "$t"
 	done
 }
 
@@ -844,7 +1323,9 @@ status() {
 	mkdir -p "$STATE_DIR" 2>/dev/null
 	USB_PATHS=$(usb_phy_paths)
 	USB_PRESENT=0
-	[ -n "$USB_PATHS" ] && USB_PRESENT=1
+	if [ -n "$USB_PATHS" ]; then
+		USB_PRESENT=1
+	fi
 	WAN=0
 	wan_ok && WAN=1
 	TRM_LEASE=0
@@ -854,19 +1335,35 @@ status() {
 		USB_RADIO=$(find_usb_radio)
 	fi
 	TRM_RADIO="$USB_RADIO"
-	[ -n "$TRM_RADIO" ] || TRM_RADIO=$(find_builtin_5g)
+	if [ -z "$TRM_RADIO" ]; then
+		TRM_RADIO=$(find_builtin_5g)
+	fi
+	WAN_LINK_DOWN=0
+	if wan_link_down; then
+		WAN_LINK_DOWN=1
+		WAN=0
+	fi
 	WAN_WAIT=0
 	if [ "$WAN" = 0 ] && [ -n "$TRM_RADIO" ] && boot_grace; then
 		WAN_WAIT=1
 	fi
 	SLIDER=0
-	slider_on && SLIDER=1
+	if slider_on; then
+		SLIDER=1
+	fi
 	echo "enabled=$ENABLED"
+	echo "guest_network=$GUEST_NET device=$(uci -q get "network.$GUEST_NET.device")"
+	echo "trm_iface=$TRM_IF network=$(uci -q get "network.$TRM_IF.device")"
+	echo "wan_link_down=$WAN_LINK_DOWN"
 	echo "slider=$SLIDER"
 	echo "wan=$WAN"
 	echo "wan_wait=$WAN_WAIT"
 	echo "usb_present=$USB_PRESENT"
-	echo "usb_active=$([ "$WAN" = 0 ] && [ "$WAN_WAIT" = 0 ] && [ -n "$USB_RADIO" ] && [ "$USB_RADIO" = "$TRM_RADIO" ] && echo 1 || echo 0)"
+	USB_ACTIVE=0
+	if [ "$WAN" = 0 ] && [ "$WAN_WAIT" = 0 ] && [ -n "$USB_RADIO" ] && [ "$USB_RADIO" = "$TRM_RADIO" ]; then
+		USB_ACTIVE=1
+	fi
+	echo "usb_active=$USB_ACTIVE"
 	echo "trm_lease=$TRM_LEASE"
 	echo "trm_radio=${TRM_RADIO:-none}"
 	echo "travelmate_running=$(tm_running && echo 1 || echo 0)"
@@ -880,6 +1377,28 @@ if [ -n "${PASANKALLA_SOURCED:-}" ]; then
 fi
 
 mkdir -p "$STATE_DIR" 2>/dev/null
+
+case "$1" in
+daemon)
+	# One daemon only: two pollers walked over each other in testing and
+	# the survivors multiplied on the writable overlay. The pid file is
+	# written with set -C (never truncated, only replaced after the stale
+	# one was removed), so the second instance reliably lands here.
+	for n in 1 2 3; do
+		prev=$(cat "$DAEMON_PID" 2>/dev/null)
+		if [ -n "$prev" ] && kill -0 "$prev" 2>/dev/null &&
+		   is_pasankalla_pid "$prev"; then
+			log "daemon already running (pid $prev)"
+			exit 0
+		fi
+		rm -f "$DAEMON_PID" 2>/dev/null
+		if (set -C; echo "$$" > "$DAEMON_PID") 2>/dev/null; then
+			trap 'rm -f "$DAEMON_PID"' EXIT INT TERM HUP
+			break
+		fi
+	done
+	;;
+esac
 case "$1" in
 apply)
 	apply_locked
@@ -889,6 +1408,10 @@ daemon)
 	;;
 status)
 	status
+	;;
+""|reload)
+	# procd reload_service runs the init reload script, which execs this.
+	apply_locked
 	;;
 *)
 	echo "usage: $0 {apply|daemon|status}" >&2

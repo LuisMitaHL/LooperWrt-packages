@@ -181,6 +181,17 @@ if ! uci -q get "network.$TRM_IF" >/dev/null 2>&1; then
 	uci -q set "network.$TRM_IF=interface"
 	uci -q set "network.$TRM_IF.proto=dhcp"
 	uci -q set "network.$TRM_IF.metric=100"
+	# The WAN zone only accepts interfaces that own a device: a
+	# device-less interface is DOWN and the zone drops forwarded traffic
+	# with error_missing_interface. Nothing is ever attached here (the STA
+	# is plugged in and out by pasankalla), so the empty bridge stands in.
+	if [ -x /sbin/swconfig ]; then
+		for d in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.=]*\)=device$/\1/p'); do
+			[ "$(uci -q get "network.$d.type")" = bridge ] || continue
+			uci -q set "network.$TRM_IF.device=$(uci -q get "network.$d.name")"
+			break
+		done
+	fi
 	NETWORK_CHANGED=1
 fi
 if ! uci -q get "network.$TRM6_IF" >/dev/null 2>&1; then
