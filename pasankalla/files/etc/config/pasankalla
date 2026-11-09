@@ -41,6 +41,10 @@ config pasankalla 'settings'
 	option led_white 'white:status'
 	option led_red 'red:power'
 
+	# Internal one-shot marker: zz-pasankalla sets this to 1 after enabling
+	# antilag and disabling tailscale. Do not set it by hand.
+	option defaults_version '0'
+
 	# Managed by zz-pasankalla: wifi-iface section names that belong to the
 	# guest AP. Empty means "discover by guest_ssid + guest_network".
 	# list guest_sections 'pasankalla2'

@@ -99,6 +99,23 @@ trm_ok() {
 	iface_v4 "$TRM_IF" || iface_v6 "$TRM6_IF"
 }
 
+# Kernel netdev backing an interface. antilag shapes netdevs, not netifd
+# interface names: "wan" is not a device and tc fails with
+# "Cannot find device "wan"".
+iface_l3dev() {
+	local d
+	d=$(ifstatus "$1" 2>/dev/null | jsonfilter -e '@["l3_device"]' 2>/dev/null)
+	case "$d" in
+	''|null)
+		d=$(uci -q get "network.$1.device")
+		;;
+	esac
+	case "$d" in
+	''|null|@*) return 1 ;;
+	esac
+	echo "$d"
+}
+
 radio_list() {
 	uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'
 }
@@ -388,6 +405,51 @@ tm_start() {
 	return 0
 }
 
+antilag_section() {
+	local s
+	for s in wan primary; do
+		[ "$(uci -q get "antilag.$s")" = antilag ] && {
+			echo "$s"
+			return 0
+		}
+	done
+	uci -q show antilag 2>/dev/null |
+		sed -n 's/^antilag\.\([^.=]*\)=antilag$/\1/p' | head -n1
+}
+
+# Keep the antilag instance on the netdev that currently carries the uplink.
+# The section starts as ul_if=wan, which does not exist; updating it here is
+# also what follows a WAN DHCP device change or a switch to travelmate.
+antilag_update() {
+	local sec dev old_ul old_dl new_dl
+
+	[ -f /etc/config/antilag ] || return 0
+	sec=$(antilag_section)
+	[ -n "$sec" ] || return 0
+
+	dev=""
+	[ "$WAN" = 1 ] && dev=$(iface_l3dev "$WAN_IF")
+	[ -z "$dev" ] && [ "$TRM_LEASE" = 1 ] && dev=$(iface_l3dev "$TRM_IF")
+	[ -n "$dev" ] || return 0
+
+	old_ul=$(uci -q get "antilag.$sec.ul_if")
+	old_dl=$(uci -q get "antilag.$sec.dl_if")
+	new_dl="ifb-$dev"
+	[ "$old_ul" = "$dev" ] && [ "$old_dl" = "$new_dl" ] && return 0
+
+	uci -q set "antilag.$sec.ul_if=$dev"
+	uci -q set "antilag.$sec.dl_if=$new_dl"
+	if ! uci -q commit antilag; then
+		log "failed to commit antilag uplink $dev"
+		return 1
+	fi
+	log "antilag $sec uplink ${old_ul:-none} -> $dev"
+	if [ -x /etc/init.d/antilag ] && /etc/init.d/antilag enabled >/dev/null 2>&1; then
+		/etc/init.d/antilag restart >/dev/null 2>&1
+	fi
+	return 0
+}
+
 wifi_reload() {
 	log "wifi reload"
 	/sbin/wifi reload >/dev/null 2>&1
@@ -541,10 +603,14 @@ apply() {
 	GUEST_LIST=$(guest_sections)
 
 	detect_log
+	antilag_update
 
 	OLD_TRM_RADIO=$(uci -q get travelmate.global.trm_radio)
 	RADIO_CHANGED=0
-	if [ "$OLD_TRM_RADIO" != "$TRM_RADIO" ]; then
+	# Only compare/announce the travelmate radio while travelmate is wanted.
+	# With WAN up TRM_RADIO is just a hint and is never written below, so
+	# comparing it every poll logged the same transition forever.
+	if [ "$WANT_TRM" = 1 ] && [ "$OLD_TRM_RADIO" != "$TRM_RADIO" ]; then
 		RADIO_CHANGED=1
 		log "radio ${OLD_TRM_RADIO:-none} -> ${TRM_RADIO:-none}"
 	fi
@@ -720,6 +786,11 @@ status() {
 	echo "guest_sections=$(guest_sections | tr '\n' ' ')"
 	echo "state=$(cat "$SIG_FILE" 2>/dev/null | cut -d'|' -f1)"
 }
+
+# Sourcing this file (tests, debugging) must not run the entry point.
+if [ -n "${PASANKALLA_SOURCED:-}" ]; then
+	return 0
+fi
 
 mkdir -p "$STATE_DIR" 2>/dev/null
 case "$1" in

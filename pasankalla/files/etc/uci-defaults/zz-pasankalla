@@ -64,6 +64,32 @@ find_dhcp_iface() {
 	return 1
 }
 
+antilag_section() {
+	local s
+	for s in wan primary; do
+		[ "$(uci -q get "antilag.$s")" = antilag ] && {
+			echo "$s"
+			return 0
+		}
+	done
+	uci -q show antilag 2>/dev/null |
+		sed -n 's/^antilag\.\([^.=]*\)=antilag$/\1/p' | head -n1
+}
+
+wan_dev() {
+	local d
+	d=$(ifstatus wan 2>/dev/null | jsonfilter -e '@["l3_device"]' 2>/dev/null)
+	case "$d" in
+	''|null)
+		d=$(uci -q get network.wan.device)
+		;;
+	esac
+	case "$d" in
+	''|null|@*) return 1 ;;
+	esac
+	echo "$d"
+}
+
 radio_list() {
 	uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'
 }
@@ -109,6 +135,7 @@ FIREWALL_CHANGED=0
 DHCP_CHANGED=0
 WIRELESS_CHANGED=0
 TRAVELMATE_CHANGED=0
+ANTILAG_CHANGED=0
 PASANKALLA_CHANGED=0
 GUEST_NET_OK=0
 
@@ -293,12 +320,48 @@ if [ -f /etc/config/travelmate ]; then
 	/etc/init.d/travelmate disable >/dev/null 2>&1
 fi
 
+# --- one-shot service defaults --------------------------------------------
+# Pasankalla is a travel router: enable the adaptive shaper on the ethernet
+# WAN and keep tailscale (plus its route watchdog) out of the boot path. The
+# marker keeps a later package upgrade from overriding an operator choice.
+if [ "$(uci -q get "$CONFIG.settings.defaults_version")" != 1 ]; then
+	if [ -f /etc/config/antilag ]; then
+		al=$(antilag_section)
+		if [ -n "$al" ]; then
+			dev=$(wan_dev)
+			if [ -n "$dev" ]; then
+				[ "$(uci -q get "antilag.$al.ul_if")" = "$dev" ] || {
+					uci -q set "antilag.$al.ul_if=$dev"
+					uci -q set "antilag.$al.dl_if=ifb-$dev"
+					ANTILAG_CHANGED=1
+				}
+			fi
+			[ "$(uci -q get "antilag.$al.enabled")" = 1 ] || {
+				uci -q set "antilag.$al.enabled=1"
+				ANTILAG_CHANGED=1
+			}
+			/etc/init.d/antilag enable >/dev/null 2>&1
+		fi
+	fi
+	if [ -x /etc/init.d/tailscale ]; then
+		/etc/init.d/tailscale stop >/dev/null 2>&1
+		/etc/init.d/tailscale disable >/dev/null 2>&1
+	fi
+	if [ -x /etc/init.d/tswatchdog ]; then
+		/etc/init.d/tswatchdog stop >/dev/null 2>&1
+		/etc/init.d/tswatchdog disable >/dev/null 2>&1
+	fi
+	uci -q set "$CONFIG.settings.defaults_version=1"
+	PASANKALLA_CHANGED=1
+fi
+
 # --- commit ----------------------------------------------------------------
 [ "$NETWORK_CHANGED" = 1 ] && { uci -q commit network || die "cannot commit network"; }
 [ "$FIREWALL_CHANGED" = 1 ] && { uci -q commit firewall || die "cannot commit firewall"; }
 [ "$DHCP_CHANGED" = 1 ] && { uci -q commit dhcp || die "cannot commit dhcp"; }
 [ "$WIRELESS_CHANGED" = 1 ] && { uci -q commit wireless || die "cannot commit wireless"; }
 [ "$TRAVELMATE_CHANGED" = 1 ] && { uci -q commit travelmate || die "cannot commit travelmate"; }
+[ "$ANTILAG_CHANGED" = 1 ] && { uci -q commit antilag || die "cannot commit antilag"; }
 [ "$PASANKALLA_CHANGED" = 1 ] && { uci -q commit "$CONFIG" || die "cannot commit $CONFIG"; }
 
 [ -n "$adopted" ] || adopted=none

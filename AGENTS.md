@@ -48,7 +48,12 @@ the package table and the net-snmp rebase procedure — don't duplicate them her
   travelmate scans, drives `white:status`/`red:power` with kernel timer
   triggers, and logs button/iface/phy events plus state transitions to
   syslog. At boot it waits `wan_grace` seconds (default 20) for the
-  ethernet WAN DHCP lease before starting travelmate. Selected only on
+  ethernet WAN DHCP lease before starting travelmate. It keeps the antilag
+  instance on the netdev that currently carries the uplink (`ul_if` = WAN
+  `l3_device`, or the travelmate STA when WAN is down; `dl_if` =
+  `ifb-<dev>`). One-shot service defaults on first boot (`defaults_version`
+  marker): antilag enabled on the WAN netdev, tailscale and tswatchdog
+  stopped and disabled when installed. Selected only on
   `pasankalla`/`pasankalla_lite` via `configs/pasankalla.config`.
 - Commit style: plain descriptive subject (see `git log`). The user controls
   pushes; commit locally, push only on request.
