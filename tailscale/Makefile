@@ -8,12 +8,12 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=tailscale
-PKG_VERSION:=1.104.2
+PKG_VERSION:=1.104.7
 PKG_RELEASE:=1
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/tailscale/tailscale/tar.gz/v$(PKG_VERSION)?
-PKG_HASH:=4c1c806e16507414a1459afcdc399f6a1323c21a1ac90f07bea0465fd8fd7e1d
+PKG_HASH:=fa1c922b33d0f6db6b073800d7a62fa84081323d247b21547c63a98ed7ecac14
 
 PKG_MAINTAINER:=Zephyr Lykos <self@mochaa.ws>, \
 		Sandro Jäckel <sandro.jaeckel@gmail.com>
@@ -22,12 +22,12 @@ PKG_LICENSE_FILES:=LICENSE
 PKG_CPE_ID:=cpe:/a:tailscale:tailscale
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/tailscale-$(PKG_VERSION)
-# v1.104.2 go.mod requires go >= 1.27.3, but the openwrt-25.12 feed default
+# v1.104.7 go.mod requires go >= 1.27.4, but the openwrt-25.12 feed default
 # (GO_DEFAULT_VERSION) is still 1.26 and golang-package.mk pins
 # GOTOOLCHAIN=local, so the generic golang/host would fail. Pin the versioned
 # host Go explicitly (same pattern as telegraf); the packages-feed
-# golang1.27 Makefile on openwrt-25.12 carries go 1.27.3 (feeds update picks
-# it up).
+# golang1.27 Makefile on openwrt-25.12 carries go 1.27.4 since the 2026-11-10
+# bump (46d425591, feeds update picks it up).
 PKG_BUILD_DEPENDS:=golang1.27/host
 PKG_BUILD_PARALLEL:=1
 PKG_BUILD_FLAGS:=no-mips16
