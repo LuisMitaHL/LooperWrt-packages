@@ -990,8 +990,11 @@ trm_uplinks() {
 # old WANT_TRM test only looked at the WAN, so a router with no uplink
 # profiles at all (the factory TR1200) still started travelmate, suspended
 # the private APs on its radio and then restarted travelmate forever with
-# "no lease yet". A configured, enabled uplink or an already loaded STA makes
-# travelmate worthwhile; otherwise the WAN-less router keeps its APs up.
+# "no lease yet". A configured, enabled uplink or an active travelmate lease
+# makes travelmate worthwhile; otherwise the WAN-less router keeps its APs
+# up. Do not use tm_stas() here: travelmate leaves a runtime trm_uplink
+# section behind after it stops, which would start it once more on the next
+# apply.
 trm_wanted() {
 	local s
 	[ -f /etc/config/travelmate ] || return 1
@@ -1000,7 +1003,7 @@ trm_wanted() {
 		[ "$(uci -q get "travelmate.$s.enabled")" = 0 ] && continue
 		return 0
 	done
-	[ -n "$(tm_stas)" ]
+	trm_ok
 }
 
 tm_stas_down() {
