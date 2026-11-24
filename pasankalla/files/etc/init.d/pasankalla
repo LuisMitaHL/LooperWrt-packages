@@ -17,6 +17,12 @@ start_service() {
 	procd_close_instance
 }
 
+stop_service() {
+	# Never leave a private AP disabled just because travelmate owned the
+	# radio when the operator stopped the service.
+	/usr/sbin/pasankalla resume
+}
+
 reload_service() {
 	/usr/sbin/pasankalla apply
 }

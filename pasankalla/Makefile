@@ -17,7 +17,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=pasankalla
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKGARCH:=all
 
 PKG_MAINTAINER:=Luis Mita <luis@luismita.com>

@@ -18,8 +18,9 @@ config pasankalla 'settings'
 	option guest_5g_follow_uplink '1'
 
 	# Slider logical state: gpio-button-hotplug reports pressed/released
-	# for BTN_0 at boot and on every flip. Set to 1 if the slider is wired
-	# the other way round on a board revision.
+	# for BTN_0 on every flip; at boot the daemon reads the mode gpio from
+	# debugfs when no event seeded the state. Set to 1 if the slider is
+	# wired the other way round on a board revision.
 	option slider_invert '0'
 
 	# At boot, wait this many seconds for the ethernet WAN to obtain its
@@ -73,6 +74,12 @@ config pasankalla 'settings'
 	# antilag at the WAN netdev, enabling it, and stopping/disabling
 	# tailscale + tswatchdog when installed. Do not set it by hand.
 	option defaults_version '0'
+
+	# Internal one-shot marker: zz-pasankalla sets this to 1 after applying
+	# the LOR_ private-AP defaults (or after finding that an aurora image
+	# already did). It keeps a package upgrade from overwriting an
+	# operator's SSID/key/channel. Do not set it by hand.
+	option wifi_defaults_version '0'
 
 	# Managed by zz-pasankalla: wifi-iface section names that belong to the
 	# guest AP. Empty means "discover by guest_ssid + guest_network".

@@ -18,6 +18,10 @@
 #     travelmate's 100); its device is set at runtime by pasankalla;
 #   * one OWE-only guest AP per built-in band, SSID "Pasankalla gratis",
 #     disabled until the slider is turned on;
+#   * the same LOR_<last 6 MAC hex> private-AP defaults the aurora image gets
+#     (first boot only): radios enabled with country BO, 2.4 GHz ch6/HT20/tx18,
+#     5 GHz ch149/VHT80/tx20, private APs on psk2. Boards that already ran
+#     99_aurora-defaults are detected by their LOR_ SSID and left alone;
 #   * the travelmate trm_iface/trm_radio baseline; travelmate is enabled by
 #     default and only stopped while the ethernet WAN carries the uplink.
 #
@@ -297,6 +301,113 @@ create_guest() {
 	WIRELESS_CHANGED=1
 	return 0
 }
+
+# --- private wifi defaults (TR3000/TR1200, first boot only) ---------------
+# The aurora image gets these from 99_aurora-defaults, but that script is
+# gated on the laotrared,aurora board and never runs on a plain Cudy. Without
+# them a fresh TR1200 boots with the stock OpenWrt SSID, no country and no
+# key. The marker keeps later package upgrades from overwriting an operator's
+# wifi. Use eth0 (the label MAC) rather than factory 0x4: on the TR1200 that
+# offset holds the MediaTek base MAC, not the Cudy label.
+set_private_wifi_defaults() {
+	local mac suffix ssid r band ch tx htmode s dev net cur_ssid cur_enc custom
+	[ "$(uci -q get "$CONFIG.settings.wifi_defaults_version")" = 1 ] && return 0
+	if uci -q show wireless 2>/dev/null | grep -q "\.ssid='LOR_"; then
+		uci -q set "$CONFIG.settings.wifi_defaults_version=1"
+		PASANKALLA_CHANGED=1
+		return 0
+	fi
+	# This also runs on package upgrade, not just on a factory boot. A
+	# private AP that no longer carries the stock OpenWrt SSID is an
+	# operator's configuration: record the marker and leave it alone.
+	custom=0
+	for s in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		case "$s" in
+		@*|trm_uplink*) continue ;;
+		esac
+		[ "$(uci -q get "wireless.$s.mode")" = ap ] || continue
+		dev=$(uci -q get "wireless.$s.device")
+		case "$dev" in
+		radio*) ;;
+		*) continue ;;
+		esac
+		[ "$(uci -q get "wireless.$s.network")" = "$GUEST_NET" ] && continue
+		cur_ssid=$(uci -q get "wireless.$s.ssid")
+		case "$cur_ssid" in
+		''|OpenWrt|"$GUEST_SSID"|"$GUEST_SSID WPA3") ;;
+		*) custom=1; break ;;
+		esac
+		cur_enc=$(uci -q get "wireless.$s.encryption")
+		case "$cur_enc" in
+		''|none|owe) ;;
+		*) custom=1; break ;;
+		esac
+	done
+	if [ "$custom" = 1 ]; then
+		uci -q set "$CONFIG.settings.wifi_defaults_version=1"
+		PASANKALLA_CHANGED=1
+		notice "private wifi defaults skipped: existing wifi config"
+		return 0
+	fi
+	mac=$(cat /sys/class/net/eth0/address 2>/dev/null)
+	[ -n "$mac" ] || mac=$(cat /sys/class/net/br-lan/address 2>/dev/null)
+	suffix=$(printf '%s' "$mac" | tr -d ':' | tr 'a-f' 'A-F' | tail -c 6)
+	[ -n "$suffix" ] || suffix=000000
+	ssid="LOR_$suffix"
+
+	for r in $(radio_list); do
+		case "$r" in
+		@*) continue ;;
+		esac
+		case "$(uci -q get "wireless.$r.path")" in
+		*usb*) continue ;;
+		esac
+		band=$(radio_band "$r")
+		case "$band" in
+		2g) ch=6; tx=18; htmode=HT20 ;;
+		5g) ch=149; tx=20; htmode=VHT80 ;;
+		*) continue ;;
+		esac
+		case "$(uci -q get "wireless.$r.htmode")" in
+		HE*) [ "$band" = 5g ] && htmode=HE80 || htmode=HE20 ;;
+		esac
+		uci -q set "wireless.$r.disabled=0"
+		uci -q set "wireless.$r.country=BO"
+		uci -q set "wireless.$r.channel=$ch"
+		uci -q set "wireless.$r.htmode=$htmode"
+		uci -q set "wireless.$r.txpower=$tx"
+		WIRELESS_CHANGED=1
+	done
+
+	for s in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		case "$s" in
+		@*|trm_uplink*) continue ;;
+		esac
+		[ "$(uci -q get "wireless.$s.mode")" = ap ] || continue
+		dev=$(uci -q get "wireless.$s.device")
+		case "$dev" in
+		radio*) ;;
+		*) continue ;;
+		esac
+		net=$(uci -q get "wireless.$s.network")
+		[ "$net" = "$GUEST_NET" ] && continue
+		cur_ssid=$(uci -q get "wireless.$s.ssid")
+		case "$cur_ssid" in
+		"$GUEST_SSID"|"$GUEST_SSID WPA3") continue ;;
+		esac
+		uci -q set "wireless.$s.disabled=0"
+		uci -q set "wireless.$s.encryption=psk2"
+		uci -q set "wireless.$s.ssid=$ssid"
+		uci -q set "wireless.$s.key=12345678"
+		uci -q set "wireless.$s.dtim_period=3"
+		WIRELESS_CHANGED=1
+	done
+	uci -q set "$CONFIG.settings.wifi_defaults_version=1"
+	PASANKALLA_CHANGED=1
+	notice "private wifi defaults ssid=$ssid"
+}
+
+set_private_wifi_defaults
 
 if [ "$GUEST_NET_OK" = 1 ]; then
 	for r in $(radio_list); do

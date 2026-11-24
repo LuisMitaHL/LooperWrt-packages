@@ -39,6 +39,10 @@ TM_FILE="$STATE_DIR/tm"
 DAEMON_PID="$STATE_DIR/daemon.pid"
 TM_RETRY_FILE="$STATE_DIR/tm_retry"
 PENDING_FILE="$STATE_DIR/pending"
+# Private APs suspended while travelmate scans on their radio. Kept outside
+# /etc/config/wireless: LuCI rewrites that file and silently drops unknown
+# per-iface options. One "iface original_disabled" line per suspended AP.
+AP_STATE_FILE=/etc/pasankalla-aps
 RG_LOCK="$STATE_DIR/run.lock"
 # Our own argv[0] + action ("/usr/sbin/pasankalla apply", "/usr/sbin/pasankalla
 # daemon"), matched against /proc/<pid>/cmdline. The daemon's lock owner is its
@@ -697,9 +701,10 @@ guest_sections() {
 
 # Private APs on the radio travelmate is using must be down while it scans
 # (the original scripts disabled wifilan5 on the built-in 5 GHz radio). The
-# original "disabled" value is stored on the same wifi-iface section, so the
-# suspend/resume transition is one atomic wireless commit and survives a
-# reboot with travelmate still active.
+# original "disabled" value is kept in AP_STATE_FILE, never as an option on
+# /etc/config/wireless: LuCI rewrites that file and drops unknown per-iface
+# options, which used to leave the AP disabled with no way to resume it after
+# a reboot. The state file survives reboot and is cleaned up on stop.
 #
 # fw4 compiles the WAN zone iifname set from the state of its member
 # packages: an interface that is down (trm_wwan right after boot, and again
@@ -735,6 +740,58 @@ sync_wan_zone() {
 	log "wan zone reloaded: $sig"
 }
 
+ap_state_get() {
+	awk -v s="$1" '$1 == s { print $2; found=1; exit } END { if (!found) exit 1 }' "$AP_STATE_FILE" 2>/dev/null
+}
+
+ap_state_has() {
+	ap_state_get "$1" >/dev/null 2>&1
+}
+
+ap_state_set() {
+	local s="$1" orig="$2" tmp="$AP_STATE_FILE.$$"
+	awk -v s="$s" '$1 != s' "$AP_STATE_FILE" 2>/dev/null > "$tmp"
+	printf '%s %s\n' "$s" "$orig" >> "$tmp"
+	mv "$tmp" "$AP_STATE_FILE"
+}
+
+ap_state_del() {
+	local s="$1" tmp="$AP_STATE_FILE.$$"
+	awk -v s="$s" '$1 != s' "$AP_STATE_FILE" 2>/dev/null > "$tmp"
+	if [ -s "$tmp" ]; then
+		mv "$tmp" "$AP_STATE_FILE"
+	else
+		rm -f "$tmp" "$AP_STATE_FILE"
+	fi
+}
+
+ap_state_list() {
+	awk '{ print $1 }' "$AP_STATE_FILE" 2>/dev/null
+}
+
+# Migrate the old pasankalla_suspended/pasankalla_orig_disabled options that
+# were written into /etc/config/wireless before the state file existed. LuCI
+# already dropped them on the live router, so this is best effort: it removes
+# them from any config that still carries them and adopts the original value.
+cleanup_legacy_markers() {
+	local s orig
+	for s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		case "$s" in
+		@*) continue ;;
+		esac
+		[ "$(uci -q get "wireless.$s.pasankalla_suspended")" = 1 ] || continue
+		orig=$(uci -q get "wireless.$s.pasankalla_orig_disabled")
+		case "$orig" in
+		0|1) ;;
+		*) orig=0 ;;
+		esac
+		ap_state_set "$s" "$orig"
+		uci -q delete "wireless.$s.pasankalla_suspended"
+		uci -q delete "wireless.$s.pasankalla_orig_disabled"
+		WIRELESS_CHANGED=1
+	done
+}
+
 suspend_aps() {
 	local r="$1" s cur
 	[ -n "$r" ] || return 0
@@ -748,12 +805,20 @@ suspend_aps() {
 		*" $s "*) continue ;;
 		esac
 		cur=$(uci -q get "wireless.$s.disabled")
-		if [ "$cur" = 1 ]; then
+		[ -n "$cur" ] || cur=0
+		if ap_state_has "$s"; then
+			# A LuCI edit may have re-enabled it while travelmate still owns
+			# the radio. Put it back down without losing the original value.
+			if [ "$cur" != 1 ]; then
+				uci -q set "wireless.$s.disabled=1"
+				WIRELESS_CHANGED=1
+			fi
 			continue
 		fi
-		[ -n "$cur" ] || cur=0
-		uci -q set "wireless.$s.pasankalla_suspended=1"
-		uci -q set "wireless.$s.pasankalla_orig_disabled=$cur"
+		# It was already disabled before we touched it: that is the
+		# operator's choice, not a suspension we should later undo.
+		[ "$cur" = 1 ] && continue
+		ap_state_set "$s" "$cur"
 		uci -q set "wireless.$s.disabled=1"
 		WIRELESS_CHANGED=1
 	done
@@ -761,16 +826,17 @@ suspend_aps() {
 
 resume_aps() {
 	local keep="$1" s dev orig
-	for s in $(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
-		case "$s" in
-		@*) continue ;;
-		esac
-		[ "$(uci -q get "wireless.$s.pasankalla_suspended")" = 1 ] || continue
+	[ -s "$AP_STATE_FILE" ] || return 0
+	for s in $(ap_state_list); do
+		if [ "$(uci -q get "wireless.$s")" != wifi-iface ]; then
+			ap_state_del "$s"
+			continue
+		fi
 		dev=$(uci -q get "wireless.$s.device")
 		if [ -n "$keep" ] && [ "$dev" = "$keep" ]; then
 			continue
 		fi
-		orig=$(uci -q get "wireless.$s.pasankalla_orig_disabled")
+		orig=$(ap_state_get "$s")
 		case "$orig" in
 		0|1) ;;
 		*) orig=0 ;;
@@ -779,18 +845,29 @@ resume_aps() {
 			uci -q set "wireless.$s.disabled=$orig"
 			WIRELESS_CHANGED=1
 		}
-		uci -q delete "wireless.$s.pasankalla_suspended"
-		uci -q delete "wireless.$s.pasankalla_orig_disabled"
-		WIRELESS_CHANGED=1
+		ap_state_del "$s"
 	done
+}
+
+slider_state() {
+	local v
+	v=$(cat "$SLIDER_FILE" 2>/dev/null)
+	case "$v" in
+	0|1) echo "$v"; return 0 ;;
+	esac
+	v=$(debugfs_slider) || return 1
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	echo "$v" > "$SLIDER_FILE" 2>/dev/null
+	echo "$v"
 }
 
 slider_on() {
 	local v
-	v=$(cat "$SLIDER_FILE" 2>/dev/null)
-	if [ -z "$v" ]; then
-		v=$(debugfs_slider)
-	fi
+	v=$(slider_state) || {
+		SLIDER_KNOWN=0
+		return 1
+	}
+	SLIDER_KNOWN=1
 	case "$v" in
 	1)
 		if [ "$SLIDER_INVERT" = 1 ]; then
@@ -805,16 +882,23 @@ slider_on() {
 		return 1
 		;;
 	esac
+	SLIDER_KNOWN=0
 	return 1
 }
 
+# Read the switch from debugfs, but only from the line that actually describes
+# the "mode" gpio. The old parser matched any line containing "mode" and
+# silently returned 0 when it could not find one: a not-yet-ready debugfs then
+# looked like "slider off" and the first boot apply disabled the guest BSS.
+# Unknown is returned as failure so the caller can leave the BSS alone and
+# retry on the next poll.
 debugfs_slider() {
 	local line
-	line=$(grep -m1 'mode' /sys/kernel/debug/gpio 2>/dev/null)
+	line=$(sed -n '/|mode[^)]*)/p' /sys/kernel/debug/gpio 2>/dev/null | head -n1)
 	case "$line" in
 	*"in  lo"*|*"in lo"*) echo 1 ;;
 	*"in  hi"*|*"in hi"*) echo 0 ;;
-	*) echo 0 ;;
+	*) return 1 ;;
 	esac
 }
 
@@ -895,6 +979,28 @@ tm_ledger() {
 tm_stas() {
 	uci -q show wireless 2>/dev/null |
 		sed -n 's/^wireless\.\(trm_uplink[0-9]*\)=wifi-iface$/\1/p'
+}
+
+trm_uplinks() {
+	uci -q show travelmate 2>/dev/null |
+		sed -n 's/^travelmate\.\([^.=]*\)=uplink$/\1/p'
+}
+
+# travelmate is only useful when it actually has somewhere to travel. The
+# old WANT_TRM test only looked at the WAN, so a router with no uplink
+# profiles at all (the factory TR1200) still started travelmate, suspended
+# the private APs on its radio and then restarted travelmate forever with
+# "no lease yet". A configured, enabled uplink or an already loaded STA makes
+# travelmate worthwhile; otherwise the WAN-less router keeps its APs up.
+trm_wanted() {
+	local s
+	[ -f /etc/config/travelmate ] || return 1
+	[ "$(uci -q get travelmate.global.trm_enabled)" = 0 ] && return 1
+	for s in $(trm_uplinks); do
+		[ "$(uci -q get "travelmate.$s.enabled")" = 0 ] && continue
+		return 0
+	done
+	[ -n "$(tm_stas)" ]
 }
 
 tm_stas_down() {
@@ -1230,6 +1336,7 @@ apply() {
 
 	WIRELESS_CHANGED=0
 	TRAVELMATE_CHANGED=0
+	cleanup_legacy_markers
 	WAN=0
 	USB_ACTIVE=0
 	TRM_LEASE=0
@@ -1336,7 +1443,7 @@ apply() {
 	# loaded, in which case travelmate keeps serving from it (the
 	# "not configured" case that used to be logged forever).
 	WANT_TRM=0
-	if [ "$WAN" = 0 ] && [ "$WAN_WAIT" = 0 ]; then
+	if [ "$WAN" = 0 ] && [ "$WAN_WAIT" = 0 ] && trm_wanted; then
 		WANT_TRM=1
 	fi
 	# The USB radio is only "active" once it really carries the uplink, i.e.
@@ -1348,6 +1455,7 @@ apply() {
 		USB_ACTIVE=1
 	fi
 	SLIDER=0
+	SLIDER_KNOWN=0
 	if slider_on; then
 		SLIDER=1
 	fi
@@ -1434,6 +1542,10 @@ apply() {
 
 	for s in $GUEST_LIST; do
 		[ "$(uci -q get "wireless.$s")" = wifi-iface ] || continue
+		# debugfs not ready (very early boot, unusual gpio line): leave the
+		# BSS exactly as it is and try again on the next poll instead of
+		# treating unknown as "slider off".
+		[ "$SLIDER_KNOWN" = 1 ] || continue
 		desired=1
 		if [ "$SLIDER" = 1 ]; then
 			desired=0
@@ -1604,6 +1716,7 @@ status() {
 		WAN_WAIT=1
 	fi
 	SLIDER=0
+	SLIDER_KNOWN=0
 	if slider_on; then
 		SLIDER=1
 	fi
@@ -1612,6 +1725,7 @@ status() {
 	echo "trm_iface=$TRM_IF device=[$(uci -q get "network.$TRM_IF.device")]"
 	echo "wan_link_down=$WAN_LINK_DOWN"
 	echo "slider=$SLIDER"
+	echo "slider_known=$SLIDER_KNOWN"
 	echo "wan=$WAN"
 	echo "wan_wait=$WAN_WAIT"
 	echo "usb_present=$USB_PRESENT"
@@ -1672,12 +1786,24 @@ daemon)
 status)
 	status
 	;;
+resume)
+	# Called from stop_service and by hand: put back every private AP that
+	# was suspended for travelmate, even if the daemon is about to stop.
+	load_cfg
+	mkdir -p "$STATE_DIR" 2>/dev/null
+	WIRELESS_CHANGED=0
+	cleanup_legacy_markers
+	resume_aps ""
+	if [ "$WIRELESS_CHANGED" = 1 ]; then
+		uci -q commit wireless && wifi_reload
+	fi
+	;;
 ""|reload)
 	# procd reload_service runs the init reload script, which execs this.
 	apply_locked
 	;;
 *)
-	echo "usage: $0 {apply|daemon|status}" >&2
+	echo "usage: $0 {apply|daemon|status|resume}" >&2
 	exit 1
 	;;
 esac
